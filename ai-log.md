@@ -116,3 +116,73 @@
 
 - [ ] アプリのレスポンシブ表示（PC中央寄せ）の最終確認
 - [ ] その他、未実装機能・調整事項の洗い出し
+
+# 2026-09-02 開発ログ：転職活動アプリ「めばえ」
+## 🛠️ 環境構築と companies CRUD 実装
+
+### 📝 やったこと
+* **Cloudflare Workers / D1 環境構築**
+  * `mebae-api` プロジェクトを作成し、`wrangler login` で認証。
+  * D1 データベース `mebae-db` を作成し、`wrangler.toml` に接続情報を設定。
+* **データベース設計（`companies` テーブル）**
+  * カラム構成: `id`, `user_id`, `company_name`, `job_url`, `job_text`, `interest_level`, `status`, `is_favorite`, `is_sleeping`, `created_at`, `updated_at`
+  * `status` の初期値は日本語（`'応募前'`）に統一。
+* **API実装とトラブシューティング**
+  * 登録（`POST /companies`）および一覧取得（`GET /companies`）APIを実装。
+  * AIとの会話長期化により一時的に簡易版（`name`/`industry`/`website`）のコードが混入するトラブルが発生するも、計画通りのカラム名へ修正完了。
+  * React側からの接続を見越し、CORS対応を追加。
+  * PowerShellの `Invoke-RestMethod` で日本語POST時に文字化けが発生。`[System.Text.Encoding]::UTF8.GetBytes()` によるUTF-8明示変換で解決。
+* **Git / GitHub 運用**
+  * 初回プッシュ時に既存ファイル（`ai-log.md`）との履歴不整合でエラーが発生したため、`git pull origin main --allow-unrelated-histories` で解消。
+  * リポジトリ名を用途が分かりやすい名前へ変更予定（`git remote set-url` で追従）。
+
+---
+
+### 🧠 DB・仕様設計の整理（メモ）
+* **主キー（ID）の捉え方**: 各テーブルの `id` は自身の通し番号であり、他テーブルから参照される場合のみ `company_id` のように命名される。
+* **動的計算の方針**: `growth_stage`（成長段階）やその分布はDBに直接保存せず、`impressions`, `honne`, `memos` などのデータから都度計算する。
+* **成長段階（`growth_stage`）の再設計**
+  * 当初の5カテゴリから「選考の進捗」を除外し、**4カテゴリ**に変更。
+  * *理由*: 選考が進むことで自動的に成長してしまうと、「選考結果と成長を連動させない」というコア思想と矛盾するため。
+  * 4カテゴリ × 4段階（たね / 双葉 / つぼみ / 花）の1対1対応に単純化。進捗バーやヒントなどの成長条件はUI上に一切明示しない方針。
+
+---
+
+### 🚀 次回へ持ち越し・その他
+* Step 6（Reactからのフォーム接続）および Gemini API を用いた求人要約・照合の実装。
+* （本日この後はポートフォリオサイト作成とイラスト制作へ時間を使用）
+
+---
+---
+
+# 2026-09-03 開発ログ：転職活動アプリ「めばえ」
+## ⚛️ React側のセットアップと CRUD 接続（Step 6完了）
+
+### 📝 やったこと
+* **React（Vite）プロジェクトの立ち上げ**
+  * `mebae-api` とは別フォルダ・別リポジトリとして `mebae-app` を作成。
+* **API連携と画面表示**
+  * `App.jsx` から API（`GET /companies`）を呼び出し、企業一覧の表示に成功。
+  * `＋植える` フォームを作成し、`POST /companies` と接続。送信時は `TextEncoder` で UTF-8 へ明示変換し、日本語文字化けを回避。
+  * 登録後にフォームをクリアし、一覧を再取得する一連の処理を実装。
+  * 前日の文字化けテストデータを `DELETE FROM companies` で一括削除・再登録。
+  * **「植える → 保存される → 一覧に反映される」というアプリの中核ループがブラウザ上で動作完了！**
+* **開発環境での学び**
+  * `wrangler dev` 実行中のターミナルで誤って `cd mebae-app` を行いプロセスが衝突。ターミナルを分離することで解決し、「1つのターミナルは同時に1つの作業しかできない」ことを実地で習得。
+* **GitHub への反映**
+  * `mebae-app` を新規リポジトリとして GitHub へプッシュ完了（`git init` 〜 `git push -u origin main`）。
+
+---
+
+### 💡 React基礎理解の整理
+* **宣言的（Declarative）UI**
+  * 手順（DOM操作）を逐一記述する命令的（Imperative）なJSとの違いを実感。
+  * `state`（`useState`）の変化を検知して React が自動で画面を描き直すため、`companies` 状態を更新するだけでリスト表示が自動的に増える仕組みを理解。
+* **基本概念の整理**: コンポーネント / state / props / useEffect
+* **ファイル命名規則**: 画面表示（JSX含む）は `.jsx`、ロジックのみは `.js` とする慣習を確認。
+
+---
+
+## 🚀 次にやること
+- [ ] モックアップのデザイン（庭のCSS等）を画面に適用・再現する作業
+- [ ] Gemini API による求人要約・希望条件照合機能の実装（Step 6 残りタスク）
