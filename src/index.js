@@ -5,7 +5,7 @@ export default {
 		// フロントエンド（別のポート）からのアクセスを許可する設定
 		const corsHeaders = {
 			"Access-Control-Allow-Origin": "*",
-			"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+			"Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
 			"Access-Control-Allow-Headers": "Content-Type",
 		};
 
@@ -36,6 +36,18 @@ export default {
 			).bind(userId, company_name, job_url || null, job_text || null, interest_level || 3).run();
 
 			return Response.json({ message: "Company added successfully!" }, { status: 201, headers: corsHeaders });
+		}
+
+		// PATCH /companies/:id : 志望度などの更新
+		if (request.method === "PATCH" && url.pathname.startsWith("/companies/")) {
+			const id = url.pathname.split("/")[2]; // URLの末尾から企業のidを取り出す
+			const body = await request.json();
+
+			await env.DB.prepare(
+				"UPDATE companies SET interest_level = ? WHERE id = ?"
+			).bind(body.interest_level, id).run();
+
+			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
 		return new Response("Mebae API is running!", { status: 200, headers: corsHeaders });
