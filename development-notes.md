@@ -41,7 +41,7 @@ prepare() → SQLを実行する準備
 bind() → SQLの?に値を入れる
 run() / all() → SQLを実行する
 
-# 2026-09-03
+# 2026-09-04
 CSS開始
 最初はサーバーが動いていなかったからそれぞれ動かすところからスタート
 - mebae-api側のターミナル　→　npx wrangler dev
