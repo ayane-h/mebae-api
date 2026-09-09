@@ -142,6 +142,150 @@ export default {
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
+		// GET /desired-conditions : 希望条件の一覧を取得
+		if (request.method === "GET" && url.pathname === "/desired-conditions") {
+			const { results } = await env.DB.prepare(
+				"SELECT * FROM desired_conditions ORDER BY created_at ASC"
+			).all();
+			return Response.json(results, { headers: corsHeaders });
+		}
+
+		// POST /desired-conditions : 希望条件を1件追加（例: "リモート勤務"）
+		if (request.method === "POST" && url.pathname === "/desired-conditions") {
+			const body = await request.json();
+			const { label } = body;
+			const userId = "dummy_user_123"; // companiesと同じく仮のユーザーID
+
+			await env.DB.prepare(
+				"INSERT INTO desired_conditions (user_id, label) VALUES (?, ?)"
+			).bind(userId, label).run();
+
+			return Response.json({ message: "Condition added successfully!" }, { status: 201, headers: corsHeaders });
+		}
+
+		// ---- Geminiを呼び出す共通処理 ----
+		// promptで質問を投げて、返ってきたJSONをそのままオブジェクトとして受け取る
+		async function callGemini(prompt, apiKey) {
+			const response = await fetch(
+				"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"x-goog-api-key": apiKey,
+					},
+					body: JSON.stringify({
+						contents: [{ parts: [{ text: prompt }] }],
+						generationConfig: {
+							responseMimeType: "application/json", // JSON形式だけを返してもらう指定
+						},
+					}),
+				}
+			);
+
+			if (!response.ok) {
+				const errText = await response.text();
+				throw new Error(`Gemini API error: ${response.status} ${errText}`);
+			}
+
+			const data = await response.json();
+			const text = data.candidates[0].content.parts[0].text;
+			return JSON.parse(text); // 文字列のJSONを、扱いやすいオブジェクトに変換
+		}
+
+		// GET /requirement-matches?company_id=1 : 照合結果の一覧を取得
+		if (request.method === "GET" && url.pathname === "/requirement-matches") {
+			const companyId = url.searchParams.get("company_id");
+			// requirement_matches と desired_conditions を「条件の名前」で結びつけて取得する
+			const { results } = await env.DB.prepare(
+				`SELECT rm.id, rm.mark, rm.note, dc.id AS condition_id, dc.label
+		 FROM requirement_matches rm
+		 JOIN desired_conditions dc ON rm.condition_id = dc.id
+		 WHERE rm.company_id = ?`
+			).bind(companyId).all();
+			return Response.json(results, { headers: corsHeaders });
+		}
+
+		// POST /requirement-matches/rematch : 求人票と希望条件をAIに照らし合わせてもらう
+		if (request.method === "POST" && url.pathname === "/requirement-matches/rematch") {
+			const body = await request.json();
+			const { company_id } = body;
+
+			// 1. 対象企業の求人票本文を取得
+			const company = await env.DB.prepare(
+				"SELECT job_text FROM companies WHERE id = ?"
+			).bind(company_id).first();
+
+			if (!company || !company.job_text) {
+				return Response.json(
+					{ error: "求人票の本文が登録されていません" },
+					{ status: 400, headers: corsHeaders }
+				);
+			}
+
+			// 2. あなたの希望条件リストを取得
+			const { results: conditions } = await env.DB.prepare(
+				"SELECT id, label FROM desired_conditions ORDER BY created_at ASC"
+			).all();
+
+			if (conditions.length === 0) {
+				return Response.json(
+					{ error: "希望条件が1件も登録されていません" },
+					{ status: 400, headers: corsHeaders }
+				);
+			}
+
+			// 3. Geminiに渡す質問文（プロンプト）を組み立てる
+			const conditionLabels = conditions.map((c) => c.label).join("、");
+			const prompt = `
+あなたは転職活動中の求人票を読んで、希望条件と照らし合わせるアシスタントです。
+以下の求人票の文章を読み、各希望条件について求人票に記載があるかを判定してください。
+
+# 求人票
+${company.job_text}
+
+# 希望条件（${conditions.length}件）
+${conditionLabels}
+
+# 出力形式
+次の形式のJSON配列だけを出力してください（説明文は不要です）。
+[
+  { "label": "条件名", "mark": "yes" または "mid" または "no", "note": "根拠となる一言（15文字程度）" }
+]
+
+判定基準:
+- "yes": 求人票にはっきり記載がある
+- "mid": 記載はあるが曖昧・条件付き
+- "no": 求人票に記載がない
+`;
+
+			// 4. Geminiを呼び出す
+			let aiResults;
+			try {
+				aiResults = await callGemini(prompt, env.GEMINI_API_KEY);
+			} catch (err) {
+				return Response.json(
+					{ error: "AIによる照合に失敗しました", detail: err.message },
+					{ status: 500, headers: corsHeaders }
+				);
+			}
+
+			// 5. 結果をDBに保存する（すでにあれば上書き、なければ新規追加＝honneと同じUPSERT）
+			for (const item of aiResults) {
+				const condition = conditions.find((c) => c.label === item.label);
+				if (!condition) continue; // AIが知らない条件名を返してきた場合はスキップ
+
+				await env.DB.prepare(
+					`INSERT INTO requirement_matches (company_id, condition_id, mark, note)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(company_id, condition_id) DO UPDATE
+			 SET mark = excluded.mark, note = excluded.note, updated_at = CURRENT_TIMESTAMP`
+				).bind(company_id, condition.id, item.mark, item.note || null).run();
+			}
+
+			return Response.json({ message: "照合しました", results: aiResults }, { headers: corsHeaders });
+		}
+
 		return new Response("Mebae API is running!", { status: 200, headers: corsHeaders });
 	},
 };
