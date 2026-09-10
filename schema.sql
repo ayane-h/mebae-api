@@ -58,3 +58,11 @@ CREATE TABLE requirement_matches (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(company_id, condition_id)
 );
+
+CREATE TABLE records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    note TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
