@@ -15,11 +15,18 @@ export default {
 		}
 
 		// 記録を1件書き込むための共通処理
-		// （毎回同じINSERT文を書かなくて済むように、関数にまとめておく）
-		async function addRecord(env, companyId, category, note) {
+		// title: タイムラインに太字で出す短いタイトル（例:"メモを追加"）
+		// detail: 日付の後ろに添える補足（例:"給与について"）。無ければ空文字でOK
+		async function addRecord(env, companyId, category, title, detail = "") {
 			await env.DB.prepare(
-				"INSERT INTO records (company_id, category, note) VALUES (?, ?, ?)"
-			).bind(companyId, category, note).run();
+				"INSERT INTO records (company_id, category, title, note) VALUES (?, ?, ?, ?)"
+			).bind(companyId, category, title, detail).run();
+		}
+
+		// いいな・気になる、メモなどの本文が長い場合に、タイムライン表示用に短く切り詰める
+		function truncate(text, maxLength = 20) {
+			if (!text) return "";
+			return text.length > maxLength ? text.slice(0, maxLength) + "…" : text;
 		}
 
 		// 「成長判定に使うカテゴリ」だけをバケット名に変換する対応表
@@ -89,15 +96,18 @@ export default {
 
 			const newCompanyId = result.meta.last_row_id; // 今作った企業のid
 
-			// 求人票の本文があるかどうかで、記録の内容を変える
+			// 求人票の本文があるかどうかで、記録のカテゴリを変える
+			// （job_text: 成長判定に使う／company_registered: 記録には残すが成長には使わない）
 			if (job_text) {
-				await addRecord(env, newCompanyId, "job_text", "求人票を登録しました");
+				await addRecord(env, newCompanyId, "job_text", "植えた日");
 			} else {
-				// job_urlだけの登録は記録には残すが、成長判定には使わないカテゴリにする
-				await addRecord(env, newCompanyId, "company_registered", "求人を保存しました");
+				await addRecord(env, newCompanyId, "company_registered", "植えた日");
 			}
 
-			return Response.json({ message: "Company added successfully!" }, { status: 201, headers: corsHeaders });
+			return Response.json(
+				{ message: "Company added successfully!", id: newCompanyId },
+				{ status: 201, headers: corsHeaders }
+			);
 		}
 
 		// PATCH /companies/:id : 志望度・ステータスなどの更新
@@ -124,8 +134,9 @@ export default {
 			).bind(...values).run();
 
 			// ステータスが変わった時だけ記録する（志望度の星だけの変更では記録しない）
+			// タイトルにステータス名そのものを使う（例:"一次面接"）
 			if (body.status !== undefined) {
-				await addRecord(env, id, "status", `選考ステータスを「${body.status}」に更新しました`);
+				await addRecord(env, id, "status", body.status);
 			}
 
 			return Response.json({ success: true }, { headers: corsHeaders });
@@ -149,8 +160,8 @@ export default {
 				"INSERT INTO impressions (company_id, type, content) VALUES (?, ?, ?)"
 			).bind(company_id, type, content).run();
 
-			const label = type === "good" ? "「いいな」" : "「気になる」";
-			await addRecord(env, company_id, "impression", `${label}を1件追加しました`);
+			const title = type === "good" ? "いいなを追加" : "気になる点を追加";
+			await addRecord(env, company_id, "impression", title, truncate(content));
 
 			return Response.json({ success: true }, { status: 201, headers: corsHeaders });
 		}
@@ -160,6 +171,30 @@ export default {
 			const id = url.pathname.split("/")[2];
 			await env.DB.prepare("DELETE FROM impressions WHERE id = ?").bind(id).run();
 			return Response.json({ success: true }, { headers: corsHeaders });
+		}
+
+		// POST /impressions/batch : 複数の「いいな・気になる」を一度に追加する
+		// （＋植える画面のチップ選択のように、1回の操作でまとめて登録したい場合に使う。
+		//  記録(records)は1件ずつではなく、全体で1件だけ作る）
+		if (request.method === "POST" && url.pathname === "/impressions/batch") {
+			const body = await request.json();
+			const { company_id, contents } = body; // contents は文字列の配列
+
+			if (!contents || contents.length === 0) {
+				return Response.json({ success: true, count: 0 }, { headers: corsHeaders });
+			}
+
+			for (const content of contents) {
+				await env.DB.prepare(
+					"INSERT INTO impressions (company_id, type, content) VALUES (?, ?, ?)"
+				).bind(company_id, "good", content).run();
+			}
+
+			// 記録は1つにまとめる（例:「いいなを3件追加」・内容を「、」で連結）
+			const title = contents.length === 1 ? "いいなを追加" : `いいなを${contents.length}件追加`;
+			await addRecord(env, company_id, "impression", title, truncate(contents.join("、"), 40));
+
+			return Response.json({ success: true, count: contents.length }, { status: 201, headers: corsHeaders });
 		}
 
 		// GET /honne?company_id=1 : 本音を取得
@@ -181,7 +216,7 @@ export default {
     ON CONFLICT(company_id) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP`
 			).bind(company_id, content).run();
 
-			await addRecord(env, company_id, "honne", "本音を記録しました");
+			await addRecord(env, company_id, "honne", "本音を記録");
 
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
@@ -204,7 +239,7 @@ export default {
 				"INSERT INTO memos (company_id, content) VALUES (?, ?)"
 			).bind(company_id, content).run();
 
-			await addRecord(env, company_id, "memo", "確認したいこと・選考メモを追加しました");
+			await addRecord(env, company_id, "memo", "メモを追加", truncate(content));
 
 			return Response.json({ success: true }, { status: 201, headers: corsHeaders });
 		}
@@ -273,9 +308,9 @@ export default {
 			// requirement_matches と desired_conditions を「条件の名前」で結びつけて取得する
 			const { results } = await env.DB.prepare(
 				`SELECT rm.id, rm.mark, rm.note, dc.id AS condition_id, dc.label
-		FROM requirement_matches rm
-		JOIN desired_conditions dc ON rm.condition_id = dc.id
-		WHERE rm.company_id = ?`
+		 FROM requirement_matches rm
+		 JOIN desired_conditions dc ON rm.condition_id = dc.id
+		 WHERE rm.company_id = ?`
 			).bind(companyId).all();
 			return Response.json(results, { headers: corsHeaders });
 		}
@@ -324,7 +359,7 @@ ${conditionLabels}
 # 出力形式
 次の形式のJSON配列だけを出力してください（説明文は不要です）。
 [
-{ "label": "条件名", "mark": "yes" または "mid" または "no", "note": "根拠となる一言（15文字程度）" }
+  { "label": "条件名", "mark": "yes" または "mid" または "no", "note": "根拠となる一言（15文字程度）" }
 ]
 
 判定基準:
@@ -351,14 +386,14 @@ ${conditionLabels}
 
 				await env.DB.prepare(
 					`INSERT INTO requirement_matches (company_id, condition_id, mark, note)
-			VALUES (?, ?, ?, ?)
-			ON CONFLICT(company_id, condition_id) DO UPDATE
-			SET mark = excluded.mark, note = excluded.note, updated_at = CURRENT_TIMESTAMP`
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(company_id, condition_id) DO UPDATE
+			 SET mark = excluded.mark, note = excluded.note, updated_at = CURRENT_TIMESTAMP`
 				).bind(company_id, condition.id, item.mark, item.note || null).run();
 			}
 
 			// 6. AI再照合したこと自体も記録する（記録には残すが、成長段階の判定には使わない）
-			await addRecord(env, company_id, "rematch", "AIが希望条件と照合しました");
+			await addRecord(env, company_id, "rematch", "AIが希望条件と照合");
 
 			return Response.json({ message: "照合しました", results: aiResults }, { headers: corsHeaders });
 		}
@@ -376,12 +411,13 @@ ${conditionLabels}
 			}
 
 			// company_idの指定がなければ、全企業分を新しい順に取得
+			// （ホーム画面から「その企業の詳細」に飛べるよう、company_idも一緒に返す）
 			const { results } = await env.DB.prepare(
-				`SELECT r.id, r.category, r.note, r.created_at, c.company_name
-				FROM records r
-				JOIN companies c ON r.company_id = c.id
-				ORDER BY r.created_at DESC
-				LIMIT 20`
+				`SELECT r.id, r.category, r.title, r.note, r.created_at, c.id AS company_id, c.company_name
+				 FROM records r
+				 JOIN companies c ON r.company_id = c.id
+				 ORDER BY r.created_at DESC
+				 LIMIT 20`
 			).all();
 			return Response.json(results, { headers: corsHeaders });
 		}
