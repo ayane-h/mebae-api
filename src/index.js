@@ -126,6 +126,18 @@ export default {
 				fields.push("status = ?");
 				values.push(body.status);
 			}
+			if (body.is_favorite !== undefined) {
+				fields.push("is_favorite = ?");
+				values.push(body.is_favorite ? 1 : 0);
+			}
+			if (body.is_sleeping !== undefined) {
+				fields.push("is_sleeping = ?");
+				values.push(body.is_sleeping ? 1 : 0);
+			}
+			if (body.job_text !== undefined) {
+				fields.push("job_text = ?");
+				values.push(body.job_text);
+			}
 
 			values.push(id);
 
@@ -170,6 +182,19 @@ export default {
 		if (request.method === "DELETE" && url.pathname.startsWith("/impressions/")) {
 			const id = url.pathname.split("/")[2];
 			await env.DB.prepare("DELETE FROM impressions WHERE id = ?").bind(id).run();
+			return Response.json({ success: true }, { headers: corsHeaders });
+		}
+
+		// PATCH /impressions/:id : いいな・気になるの文言をタップして編集する
+		if (request.method === "PATCH" && url.pathname.startsWith("/impressions/")) {
+			const id = url.pathname.split("/")[2];
+			const body = await request.json();
+			const { content } = body;
+
+			await env.DB.prepare(
+				"UPDATE impressions SET content = ? WHERE id = ?"
+			).bind(content, id).run();
+
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
@@ -251,6 +276,19 @@ export default {
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
+		// PATCH /memos/:id : メモの文言をタップして編集する
+		if (request.method === "PATCH" && url.pathname.startsWith("/memos/")) {
+			const id = url.pathname.split("/")[2];
+			const body = await request.json();
+			const { content } = body;
+
+			await env.DB.prepare(
+				"UPDATE memos SET content = ? WHERE id = ?"
+			).bind(content, id).run();
+
+			return Response.json({ success: true }, { headers: corsHeaders });
+		}
+
 		// GET /desired-conditions : 希望条件の一覧を取得
 		if (request.method === "GET" && url.pathname === "/desired-conditions") {
 			const { results } = await env.DB.prepare(
@@ -307,12 +345,26 @@ export default {
 			const companyId = url.searchParams.get("company_id");
 			// requirement_matches と desired_conditions を「条件の名前」で結びつけて取得する
 			const { results } = await env.DB.prepare(
-				`SELECT rm.id, rm.mark, rm.note, dc.id AS condition_id, dc.label
+				`SELECT rm.id, rm.mark, rm.note, rm.manually_edited, dc.id AS condition_id, dc.label
 		 FROM requirement_matches rm
 		 JOIN desired_conditions dc ON rm.condition_id = dc.id
 		 WHERE rm.company_id = ?`
 			).bind(companyId).all();
 			return Response.json(results, { headers: corsHeaders });
+		}
+
+		// PATCH /requirement-matches/:id : 手動でmarkを書き換える（表をタップした時）
+		// タップして直した記録として manually_edited = 1 を立てる
+		if (request.method === "PATCH" && url.pathname.startsWith("/requirement-matches/")) {
+			const id = url.pathname.split("/")[2];
+			const body = await request.json();
+			const { mark } = body;
+
+			await env.DB.prepare(
+				"UPDATE requirement_matches SET mark = ?, manually_edited = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+			).bind(mark, id).run();
+
+			return Response.json({ success: true, mark }, { headers: corsHeaders });
 		}
 
 		// POST /requirement-matches/rematch : 求人票と希望条件をAIに照らし合わせてもらう
@@ -385,10 +437,10 @@ ${conditionLabels}
 				if (!condition) continue; // AIが知らない条件名を返してきた場合はスキップ
 
 				await env.DB.prepare(
-					`INSERT INTO requirement_matches (company_id, condition_id, mark, note)
-			 VALUES (?, ?, ?, ?)
+					`INSERT INTO requirement_matches (company_id, condition_id, mark, note, manually_edited)
+			 VALUES (?, ?, ?, ?, 0)
 			 ON CONFLICT(company_id, condition_id) DO UPDATE
-			 SET mark = excluded.mark, note = excluded.note, updated_at = CURRENT_TIMESTAMP`
+			 SET mark = excluded.mark, note = excluded.note, manually_edited = 0, updated_at = CURRENT_TIMESTAMP`
 				).bind(company_id, condition.id, item.mark, item.note || null).run();
 			}
 
@@ -405,7 +457,7 @@ ${conditionLabels}
 
 			if (companyId) {
 				const { results } = await env.DB.prepare(
-					"SELECT * FROM records WHERE company_id = ? ORDER BY created_at DESC"
+					"SELECT * FROM records WHERE company_id = ? ORDER BY created_at DESC, id DESC"
 				).bind(companyId).all();
 				return Response.json(results, { headers: corsHeaders });
 			}
@@ -416,7 +468,7 @@ ${conditionLabels}
 				`SELECT r.id, r.category, r.title, r.note, r.created_at, c.id AS company_id, c.company_name
 				 FROM records r
 				 JOIN companies c ON r.company_id = c.id
-				 ORDER BY r.created_at DESC
+				 ORDER BY r.created_at DESC, r.id DESC
 				 LIMIT 20`
 			).all();
 			return Response.json(results, { headers: corsHeaders });

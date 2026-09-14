@@ -68,3 +68,5 @@ CREATE TABLE records (
 );
 
 ALTER TABLE records ADD COLUMN title TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE requirement_matches ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0;
