@@ -135,8 +135,26 @@ export default {
 				values.push(body.is_sleeping ? 1 : 0);
 			}
 			if (body.job_text !== undefined) {
+				// 求人票の中身が実際に変わったかどうかを確認する
+				// （変わっていれば、手動編集済みの選考フローもAIに見直させたいのでリセットする）
+				const current = await env.DB.prepare(
+					"SELECT job_text FROM companies WHERE id = ?"
+				).bind(id).first();
+				const jobTextChanged = !current || current.job_text !== body.job_text;
+
 				fields.push("job_text = ?");
 				values.push(body.job_text);
+
+				if (jobTextChanged) {
+					fields.push("selection_flow_manually_edited = ?");
+					values.push(0);
+				}
+			}
+			if (body.selection_flow !== undefined) {
+				fields.push("selection_flow = ?");
+				fields.push("selection_flow_manually_edited = ?");
+				values.push(body.selection_flow);
+				values.push(1);
 			}
 
 			values.push(id);
@@ -368,13 +386,14 @@ export default {
 		}
 
 		// POST /requirement-matches/rematch : 求人票と希望条件をAIに照らし合わせてもらう
+		// あわせて、選考メモの提案（面接で確認するとよい質問）もAIに考えてもらう
 		if (request.method === "POST" && url.pathname === "/requirement-matches/rematch") {
 			const body = await request.json();
 			const { company_id } = body;
 
 			// 1. 対象企業の求人票本文を取得
 			const company = await env.DB.prepare(
-				"SELECT job_text FROM companies WHERE id = ?"
+				"SELECT job_text, selection_flow_manually_edited FROM companies WHERE id = ?"
 			).bind(company_id).first();
 
 			if (!company || !company.job_text) {
@@ -396,34 +415,72 @@ export default {
 				);
 			}
 
+			// 2.5 すでに自分で書いている選考メモを取得（AIへの提案が重複しないようにするため）
+			const { results: existingMemos } = await env.DB.prepare(
+				"SELECT content FROM memos WHERE company_id = ?"
+			).bind(company_id).all();
+			const existingMemoText = existingMemos.length > 0
+				? existingMemos.map((m) => `・${m.content}`).join("\n")
+				: "（まだ何もありません）";
+
 			// 3. Geminiに渡す質問文（プロンプト）を組み立てる
 			const conditionLabels = conditions.map((c) => c.label).join("、");
+
+			// 選考フローが手動編集済み（かつ求人票も変わっていない）なら、
+			// AIに選考フローを考えさせること自体を省略する（時間・コストの節約）
+			const needsSelectionFlow = !company.selection_flow_manually_edited;
+
+			const selectionFlowTask = needsSelectionFlow
+				? "また、求人票の中に選考フロー（書類選考→面接→内定 のような選考の流れ）が書かれていれば、それも抽出してください。\n"
+				: "";
+			const selectionFlowFormat = needsSelectionFlow
+				? `,\n  "selection_flow": "選考フローの文字列、または記載がなければ「記載なし」"`
+				: "";
+			const selectionFlowRule = needsSelectionFlow
+				? `\n選考フローの条件:
+- 求人票に書かれている内容だけを書き写す。書かれていないことを推測して作らない
+- 「書類選考 → 一次面接 → 最終面接」のように「→」で区切った短い形にする
+- 求人票のどこにも選考フローの記載がなければ、必ず「記載なし」とだけ書く`
+				: "";
+
 			const prompt = `
 あなたは転職活動中の求人票を読んで、希望条件と照らし合わせるアシスタントです。
 以下の求人票の文章を読み、各希望条件について求人票に記載があるかを判定してください。
-
+あわせて、求人票全体（特に△・×がついた項目）を踏まえて、面接で確認するとよい質問も2つ考えてください。
+${selectionFlowTask}
 # 求人票
 ${company.job_text}
 
 # 希望条件（${conditions.length}件）
 ${conditionLabels}
 
+# すでに自分で書いている選考メモ（この内容と重複しない質問を考えてください）
+${existingMemoText}
+
 # 出力形式
-次の形式のJSON配列だけを出力してください（説明文は不要です）。
-[
-  { "label": "条件名", "mark": "yes" または "mid" または "no", "note": "根拠となる一言（15文字程度）" }
-]
+次の形式のJSONだけを出力してください（説明文は不要です）。
+{
+  "matches": [
+    { "label": "条件名", "mark": "yes" または "mid" または "no", "note": "根拠となる一言（15文字程度）" }
+  ],
+  "suggested_questions": ["質問1", "質問2"]${selectionFlowFormat}
+}
 
 判定基準:
 - "yes": 求人票にはっきり記載がある
 - "mid": 記載はあるが曖昧・条件付き
 - "no": 求人票に記載がない
+
+質問の条件:
+- 20文字前後の短い一文にする
+- △・×がついた条件を優先して考える
+${selectionFlowRule}
 `;
 
 			// 4. Geminiを呼び出す
-			let aiResults;
+			let aiResult;
 			try {
-				aiResults = await callGemini(prompt, env.GEMINI_API_KEY);
+				aiResult = await callGemini(prompt, env.GEMINI_API_KEY);
 			} catch (err) {
 				return Response.json(
 					{ error: "AIによる照合に失敗しました", detail: err.message },
@@ -431,7 +488,11 @@ ${conditionLabels}
 				);
 			}
 
-			// 5. 結果をDBに保存する（すでにあれば上書き、なければ新規追加＝honneと同じUPSERT）
+			const aiResults = aiResult.matches || [];
+			const suggestedQuestions = aiResult.suggested_questions || [];
+			const selectionFlow = aiResult.selection_flow || "記載なし";
+
+			// 5. 照合結果をDBに保存する（すでにあれば上書き、なければ新規追加＝honneと同じUPSERT）
 			for (const item of aiResults) {
 				const condition = conditions.find((c) => c.label === item.label);
 				if (!condition) continue; // AIが知らない条件名を返してきた場合はスキップ
@@ -444,10 +505,44 @@ ${conditionLabels}
 				).bind(company_id, condition.id, item.mark, item.note || null).run();
 			}
 
+			// 5.5 選考メモの提案を保存する
+			// 未採用の提案（ai_suggestions）は、いったん全部消してから新しい提案を入れ直す
+			// （採用済みのものはすでにmemosに移動済みなので、ここでは影響を受けない）
+			await env.DB.prepare("DELETE FROM ai_suggestions WHERE company_id = ?").bind(company_id).run();
+			for (const question of suggestedQuestions) {
+				await env.DB.prepare(
+					"INSERT INTO ai_suggestions (company_id, content) VALUES (?, ?)"
+				).bind(company_id, question).run();
+			}
+
+			// 5.6 選考フローを保存する（AIによる抽出なので manually_edited は 0 に戻す）
+			// ただし、すでに手動で編集済みの場合は、AIの抽出結果で上書きしない（スキップする）
+			if (!company.selection_flow_manually_edited) {
+				await env.DB.prepare(
+					"UPDATE companies SET selection_flow = ?, selection_flow_manually_edited = 0 WHERE id = ?"
+				).bind(selectionFlow, company_id).run();
+			}
+
 			// 6. AI再照合したこと自体も記録する（記録には残すが、成長段階の判定には使わない）
 			await addRecord(env, company_id, "rematch", "AIが希望条件と照合");
 
 			return Response.json({ message: "照合しました", results: aiResults }, { headers: corsHeaders });
+		}
+
+		// GET /ai-suggestions?company_id=1 : 未採用のAI提案（選考メモの候補）を取得
+		if (request.method === "GET" && url.pathname === "/ai-suggestions") {
+			const companyId = url.searchParams.get("company_id");
+			const { results } = await env.DB.prepare(
+				"SELECT * FROM ai_suggestions WHERE company_id = ? ORDER BY id ASC"
+			).bind(companyId).all();
+			return Response.json(results, { headers: corsHeaders });
+		}
+
+		// DELETE /ai-suggestions/:id : AI提案を1件消す（採用した時・不要な時どちらも使う）
+		if (request.method === "DELETE" && url.pathname.startsWith("/ai-suggestions/")) {
+			const id = url.pathname.split("/")[2];
+			await env.DB.prepare("DELETE FROM ai_suggestions WHERE id = ?").bind(id).run();
+			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
 		// GET /records?company_id=1 : 特定の企業の記録一覧（詳細画面のタイムライン用）

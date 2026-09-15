@@ -70,3 +70,13 @@ CREATE TABLE records (
 ALTER TABLE records ADD COLUMN title TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE requirement_matches ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS ai_suggestions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE companies ADD COLUMN selection_flow TEXT;
+ALTER TABLE companies ADD COLUMN selection_flow_manually_edited INTEGER NOT NULL DEFAULT 0;
