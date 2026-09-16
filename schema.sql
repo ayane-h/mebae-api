@@ -80,3 +80,5 @@ CREATE TABLE IF NOT EXISTS ai_suggestions (
 
 ALTER TABLE companies ADD COLUMN selection_flow TEXT;
 ALTER TABLE companies ADD COLUMN selection_flow_manually_edited INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE desired_conditions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;

@@ -310,22 +310,62 @@ export default {
 		// GET /desired-conditions : 希望条件の一覧を取得
 		if (request.method === "GET" && url.pathname === "/desired-conditions") {
 			const { results } = await env.DB.prepare(
-				"SELECT * FROM desired_conditions ORDER BY created_at ASC"
+				"SELECT * FROM desired_conditions ORDER BY sort_order ASC, created_at ASC"
 			).all();
 			return Response.json(results, { headers: corsHeaders });
 		}
 
 		// POST /desired-conditions : 希望条件を1件追加（例: "リモート勤務"）
+		// 並び順は「今まで登録した数」を使い、常に一番最後に追加されるようにする
 		if (request.method === "POST" && url.pathname === "/desired-conditions") {
 			const body = await request.json();
 			const { label } = body;
 			const userId = "dummy_user_123"; // companiesと同じく仮のユーザーID
 
+			const countRow = await env.DB.prepare(
+				"SELECT COUNT(*) AS cnt FROM desired_conditions"
+			).first();
+
 			await env.DB.prepare(
-				"INSERT INTO desired_conditions (user_id, label) VALUES (?, ?)"
-			).bind(userId, label).run();
+				"INSERT INTO desired_conditions (user_id, label, sort_order) VALUES (?, ?, ?)"
+			).bind(userId, label, countRow.cnt).run();
 
 			return Response.json({ message: "Condition added successfully!" }, { status: 201, headers: corsHeaders });
+		}
+
+		// PATCH /desired-conditions/reorder : 並び替えた後の順番をまとめて保存する
+		// body: { order: [3, 1, 2] } のような、希望条件idを新しい順番で並べた配列
+		if (request.method === "PATCH" && url.pathname === "/desired-conditions/reorder") {
+			const body = await request.json();
+			const { order } = body;
+
+			for (let i = 0; i < order.length; i++) {
+				await env.DB.prepare(
+					"UPDATE desired_conditions SET sort_order = ? WHERE id = ?"
+				).bind(i, order[i]).run();
+			}
+
+			return Response.json({ success: true }, { headers: corsHeaders });
+		}
+
+		// PATCH /desired-conditions/:id : 希望条件の文言をタップして編集する
+		if (request.method === "PATCH" && url.pathname.startsWith("/desired-conditions/")) {
+			const id = url.pathname.split("/")[2];
+			const body = await request.json();
+			const { label } = body;
+
+			await env.DB.prepare(
+				"UPDATE desired_conditions SET label = ? WHERE id = ?"
+			).bind(label, id).run();
+
+			return Response.json({ success: true }, { headers: corsHeaders });
+		}
+
+		// DELETE /desired-conditions/:id : 希望条件を1件削除
+		if (request.method === "DELETE" && url.pathname.startsWith("/desired-conditions/")) {
+			const id = url.pathname.split("/")[2];
+			await env.DB.prepare("DELETE FROM desired_conditions WHERE id = ?").bind(id).run();
+			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
 		// ---- Geminiを呼び出す共通処理 ----
@@ -362,11 +402,13 @@ export default {
 		if (request.method === "GET" && url.pathname === "/requirement-matches") {
 			const companyId = url.searchParams.get("company_id");
 			// requirement_matches と desired_conditions を「条件の名前」で結びつけて取得する
+			// 並び順は希望条件側のsort_orderに合わせる（希望条件の並びを変えると、ここも連動する）
 			const { results } = await env.DB.prepare(
 				`SELECT rm.id, rm.mark, rm.note, rm.manually_edited, dc.id AS condition_id, dc.label
 		 FROM requirement_matches rm
 		 JOIN desired_conditions dc ON rm.condition_id = dc.id
-		 WHERE rm.company_id = ?`
+		 WHERE rm.company_id = ?
+		 ORDER BY dc.sort_order ASC, dc.created_at ASC`
 			).bind(companyId).all();
 			return Response.json(results, { headers: corsHeaders });
 		}
@@ -567,6 +609,46 @@ ${selectionFlowRule}
 				 LIMIT 20`
 			).all();
 			return Response.json(results, { headers: corsHeaders });
+		}
+
+		// GET /export : すべてのデータをJSON形式でまとめて取得する（バックアップ用）
+		if (request.method === "GET" && url.pathname === "/export") {
+			const [companiesData, impressionsData, honneData, memosData, conditionsData, matchesData, recordsData] =
+				await Promise.all([
+					env.DB.prepare("SELECT * FROM companies").all(),
+					env.DB.prepare("SELECT * FROM impressions").all(),
+					env.DB.prepare("SELECT * FROM honne").all(),
+					env.DB.prepare("SELECT * FROM memos").all(),
+					env.DB.prepare("SELECT * FROM desired_conditions").all(),
+					env.DB.prepare("SELECT * FROM requirement_matches").all(),
+					env.DB.prepare("SELECT * FROM records").all(),
+				]);
+
+			return Response.json({
+				exported_at: new Date().toISOString(),
+				companies: companiesData.results,
+				impressions: impressionsData.results,
+				honne: honneData.results,
+				memos: memosData.results,
+				desired_conditions: conditionsData.results,
+				requirement_matches: matchesData.results,
+				records: recordsData.results,
+			}, { headers: corsHeaders });
+		}
+
+		// DELETE /all-data : すべてのデータを削除する（確認画面を経てからのみ呼び出す想定）
+		if (request.method === "DELETE" && url.pathname === "/all-data") {
+			await Promise.all([
+				env.DB.prepare("DELETE FROM impressions").run(),
+				env.DB.prepare("DELETE FROM honne").run(),
+				env.DB.prepare("DELETE FROM memos").run(),
+				env.DB.prepare("DELETE FROM requirement_matches").run(),
+				env.DB.prepare("DELETE FROM records").run(),
+				env.DB.prepare("DELETE FROM ai_suggestions").run(),
+				env.DB.prepare("DELETE FROM desired_conditions").run(),
+				env.DB.prepare("DELETE FROM companies").run(),
+			]);
+			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
 		return new Response("Mebae API is running!", { status: 200, headers: corsHeaders });
