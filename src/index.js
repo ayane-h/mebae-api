@@ -1,3 +1,8 @@
+// バイト列を16進数の文字列に変換する（結果を見やすく表示するための補助関数）
+function bytesToHex(bytes) {
+	return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
