@@ -12,7 +12,7 @@ function bytesToHex(bytes) {
 const ALLOWED_FRONTEND_ORIGINS = [
 	"http://localhost:5173",
 	"http://127.0.0.1:5173",
-	"https://mebae-app.vercel.app/",
+	"https://mebae-app.vercel.app",
 ];
 
 // 企業一覧の1行に収まる、ひとことメモの最大文字数（フロントエンド側と同じ値にしておく）
@@ -23,7 +23,10 @@ const SHORT_MEMO_MAX = 10;
 async function getUserId(request, env) {
 	const authHeader = request.headers.get("Authorization") || "";
 	const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-	if (!token) return null;
+	if (!token) {
+		console.error("トークンが添えられていません");
+		return null;
+	}
 
 	try {
 		const options = {
@@ -40,7 +43,10 @@ async function getUserId(request, env) {
 		const hasErrors = Array.isArray(result?.errors)
 			? result.errors.length > 0
 			: !!(result?.errors || result?.error);
-		if (hasErrors) return null;
+		if (hasErrors) {
+			console.error("トークンの検証に失敗しました:", JSON.stringify(result.errors || result.error));
+			return null;
+		}
 		const claims = result && "data" in result ? result.data : result;
 		return claims && claims.sub ? claims.sub : null;
 	} catch (err) {
