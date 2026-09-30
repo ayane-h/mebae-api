@@ -1,6 +1,51 @@
+import { verifyToken } from "@clerk/backend";
+
 // バイト列を16進数の文字列に変換する（結果を見やすく表示するための補助関数）
 function bytesToHex(bytes) {
 	return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---- 認証：フロントエンドとして許可する場所 ----
+// Clerkのトークンには「どのサイトで発行されたか」が入っている。ここに書いたサイト以外で
+// 発行されたトークンは受け付けない（他のサイトで発行されたトークンの使い回しを防ぐため）。
+// Viteのポートが5173以外になった場合や、Vercelで公開した時は、ここにURLを追加する。
+const ALLOWED_FRONTEND_ORIGINS = [
+	"http://localhost:5173",
+	"http://127.0.0.1:5173",
+];
+
+// 企業一覧の1行に収まる、ひとことメモの最大文字数（フロントエンド側と同じ値にしておく）
+const SHORT_MEMO_MAX = 10;
+
+// ---- 認証：リクエストに添えられたClerkのトークンを検証して、ログイン中のユーザーIDを返す ----
+// 本物のトークンなら user_xxxxx のようなIDを返し、無い・偽物・期限切れなら null を返す
+async function getUserId(request, env) {
+	const authHeader = request.headers.get("Authorization") || "";
+	const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+	if (!token) return null;
+
+	try {
+		const options = {
+			secretKey: env.CLERK_SECRET_KEY,
+			authorizedParties: ALLOWED_FRONTEND_ORIGINS,
+		};
+		// CLERK_JWT_KEY（Clerkの公開鍵）を登録してあれば、通信なしで検証できる（任意）
+		if (env.CLERK_JWT_KEY) options.jwtKey = env.CLERK_JWT_KEY;
+
+		const result = await verifyToken(token, options);
+
+		// ライブラリのバージョンによって、「中身そのもの」か「{ data, errors }」のどちらかで返ってくるため、両方に対応する
+		// （errorsが空の配列 [] の場合は、エラーなしとして扱う）
+		const hasErrors = Array.isArray(result?.errors)
+			? result.errors.length > 0
+			: !!(result?.errors || result?.error);
+		if (hasErrors) return null;
+		const claims = result && "data" in result ? result.data : result;
+		return claims && claims.sub ? claims.sub : null;
+	} catch (err) {
+		console.error("トークンの検証に失敗しました:", err.message);
+		return null;
+	}
 }
 
 export default {
@@ -8,15 +53,41 @@ export default {
 		const url = new URL(request.url);
 
 		// フロントエンド（別のポート）からのアクセスを許可する設定
+		// Authorization は、ログイン中のトークンを添えるために必要
 		const corsHeaders = {
 			"Access-Control-Allow-Origin": "*",
 			"Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, PUT, OPTIONS",
-			"Access-Control-Allow-Headers": "Content-Type",
+			"Access-Control-Allow-Headers": "Content-Type, Authorization",
 		};
 
-		// ブラウザが本番リクエストの前に送る確認リクエストへの応答
+		// ブラウザが本番リクエストの前に送る確認リクエストへの応答（ここではログイン確認をしない）
 		if (request.method === "OPTIONS") {
 			return new Response(null, { headers: corsHeaders });
+		}
+
+		// 動作確認用のトップページだけは、ログインなしで見られるようにしておく
+		if (url.pathname === "/") {
+			return new Response("Mebae API is running!", { status: 200, headers: corsHeaders });
+		}
+
+		// ---- ここから先は、ログインしている人だけが使える ----
+		const userId = await getUserId(request, env);
+		if (!userId) {
+			return Response.json({ error: "ログインが必要です" }, { status: 401, headers: corsHeaders });
+		}
+
+		// 他人のデータや存在しないデータには、「見つかりません」と返す
+		// （「他人のデータがある」ことを教えないよう、403ではなく404にしている）
+		const notFound = () =>
+			Response.json({ error: "見つかりません" }, { status: 404, headers: corsHeaders });
+
+		// この企業は、ログイン中のユーザー本人のものか？を確認する
+		async function ownsCompany(companyId) {
+			if (!companyId) return false;
+			const row = await env.DB.prepare(
+				"SELECT id FROM companies WHERE id = ? AND user_id = ?"
+			).bind(companyId, userId).first();
+			return !!row;
 		}
 
 		// 記録を1件書き込むための共通処理
@@ -62,13 +133,16 @@ export default {
 		// GET /companies : 企業一覧の取得（各企業に成長段階 growth_stage を付けて返す）
 		if (request.method === "GET" && url.pathname === "/companies") {
 			const { results: companies } = await env.DB.prepare(
-				"SELECT * FROM companies ORDER BY created_at DESC"
-			).all();
+				"SELECT * FROM companies WHERE user_id = ? ORDER BY created_at DESC"
+			).bind(userId).all();
 
-			// 全企業分のrecordsを一度に取得（企業ごとにクエリを投げると遅くなるため、まとめて取る）
+			// 自分の企業のrecordsだけを、一度にまとめて取得する
 			const { results: allRecords } = await env.DB.prepare(
-				"SELECT company_id, category FROM records"
-			).all();
+				`SELECT r.company_id, r.category
+				 FROM records r
+				 JOIN companies c ON r.company_id = c.id
+				 WHERE c.user_id = ?`
+			).bind(userId).all();
 
 			// company_idごとに、カテゴリの配列をまとめる
 			const categoriesByCompany = {};
@@ -86,13 +160,10 @@ export default {
 			return Response.json(companiesWithStage, { headers: corsHeaders });
 		}
 
-		// POST /companies : 企業の新規登録
+		// POST /companies : 企業の新規登録（持ち主は、ログイン中のユーザー）
 		if (request.method === "POST" && url.pathname === "/companies") {
 			const body = await request.json();
 			const { company_name, job_url, job_text, interest_level } = body;
-
-			// 開発初期のため user_id は固定（ダミー）
-			const userId = "dummy_user_123";
 
 			const result = await env.DB.prepare(
 				`INSERT INTO companies (user_id, company_name, job_url, job_text, interest_level)
@@ -118,6 +189,8 @@ export default {
 		// PATCH /companies/:id : 志望度・ステータスなどの更新
 		if (request.method === "PATCH" && url.pathname.startsWith("/companies/")) {
 			const id = url.pathname.split("/")[2];
+			if (!(await ownsCompany(id))) return notFound();
+
 			const body = await request.json();
 
 			const fields = [];
@@ -139,12 +212,24 @@ export default {
 				fields.push("is_sleeping = ?");
 				values.push(body.is_sleeping ? 1 : 0);
 			}
+			if (body.short_memo !== undefined) {
+				// 前後の空白を取り除き、空ならnull（メモなし）として保存する
+				const memo = (body.short_memo || "").trim();
+				if (memo.length > SHORT_MEMO_MAX) {
+					return Response.json(
+						{ error: `ひとことメモは${SHORT_MEMO_MAX}文字以内で入力してください` },
+						{ status: 400, headers: corsHeaders }
+					);
+				}
+				fields.push("short_memo = ?");
+				values.push(memo || null);
+			}
 			if (body.job_text !== undefined) {
 				// 求人票の中身が実際に変わったかどうかを確認する
 				// （変わっていれば、手動編集済みの選考フローもAIに見直させたいのでリセットする）
 				const current = await env.DB.prepare(
-					"SELECT job_text FROM companies WHERE id = ?"
-				).bind(id).first();
+					"SELECT job_text FROM companies WHERE id = ? AND user_id = ?"
+				).bind(id, userId).first();
 				const jobTextChanged = !current || current.job_text !== body.job_text;
 
 				fields.push("job_text = ?");
@@ -162,10 +247,16 @@ export default {
 				values.push(1);
 			}
 
+			// 更新する項目が1つもなければ、何もせずに成功を返す
+			if (fields.length === 0) {
+				return Response.json({ success: true }, { headers: corsHeaders });
+			}
+
 			values.push(id);
+			values.push(userId);
 
 			await env.DB.prepare(
-				`UPDATE companies SET ${fields.join(", ")} WHERE id = ?`
+				`UPDATE companies SET ${fields.join(", ")} WHERE id = ? AND user_id = ?`
 			).bind(...values).run();
 
 			// ステータスが変わった時だけ記録する（志望度の星だけの変更では記録しない）
@@ -180,6 +271,8 @@ export default {
 		// GET /impressions?company_id=1 : 特定の企業のいいな・気になるを取得
 		if (request.method === "GET" && url.pathname === "/impressions") {
 			const companyId = url.searchParams.get("company_id");
+			if (!(await ownsCompany(companyId))) return notFound();
+
 			const { results } = await env.DB.prepare(
 				"SELECT * FROM impressions WHERE company_id = ? ORDER BY created_at DESC"
 			).bind(companyId).all();
@@ -190,6 +283,7 @@ export default {
 		if (request.method === "POST" && url.pathname === "/impressions") {
 			const body = await request.json();
 			const { company_id, type, content } = body;
+			if (!(await ownsCompany(company_id))) return notFound();
 
 			await env.DB.prepare(
 				"INSERT INTO impressions (company_id, type, content) VALUES (?, ?, ?)"
@@ -202,9 +296,12 @@ export default {
 		}
 
 		// DELETE /impressions/:id : いいな・気になるを削除
+		// 「自分の企業に紐づくものだけ」を対象にする条件を、SQLの中に含めている
 		if (request.method === "DELETE" && url.pathname.startsWith("/impressions/")) {
 			const id = url.pathname.split("/")[2];
-			await env.DB.prepare("DELETE FROM impressions WHERE id = ?").bind(id).run();
+			await env.DB.prepare(
+				"DELETE FROM impressions WHERE id = ? AND company_id IN (SELECT id FROM companies WHERE user_id = ?)"
+			).bind(id, userId).run();
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
@@ -215,8 +312,8 @@ export default {
 			const { content } = body;
 
 			await env.DB.prepare(
-				"UPDATE impressions SET content = ? WHERE id = ?"
-			).bind(content, id).run();
+				"UPDATE impressions SET content = ? WHERE id = ? AND company_id IN (SELECT id FROM companies WHERE user_id = ?)"
+			).bind(content, id, userId).run();
 
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
@@ -227,6 +324,7 @@ export default {
 		if (request.method === "POST" && url.pathname === "/impressions/batch") {
 			const body = await request.json();
 			const { company_id, contents } = body; // contents は文字列の配列
+			if (!(await ownsCompany(company_id))) return notFound();
 
 			if (!contents || contents.length === 0) {
 				return Response.json({ success: true, count: 0 }, { headers: corsHeaders });
@@ -248,6 +346,8 @@ export default {
 		// GET /honne?company_id=1 : 本音を取得
 		if (request.method === "GET" && url.pathname === "/honne") {
 			const companyId = url.searchParams.get("company_id");
+			if (!(await ownsCompany(companyId))) return notFound();
+
 			const { results } = await env.DB.prepare(
 				"SELECT * FROM honne WHERE company_id = ?"
 			).bind(companyId).all();
@@ -258,6 +358,7 @@ export default {
 		if (request.method === "PUT" && url.pathname === "/honne") {
 			const body = await request.json();
 			const { company_id, content } = body;
+			if (!(await ownsCompany(company_id))) return notFound();
 
 			await env.DB.prepare(
 				`INSERT INTO honne (company_id, content) VALUES (?, ?)
@@ -272,6 +373,8 @@ export default {
 		// GET /memos?company_id=1 : 特定の企業のメモを取得
 		if (request.method === "GET" && url.pathname === "/memos") {
 			const companyId = url.searchParams.get("company_id");
+			if (!(await ownsCompany(companyId))) return notFound();
+
 			const { results } = await env.DB.prepare(
 				"SELECT * FROM memos WHERE company_id = ? ORDER BY created_at DESC"
 			).bind(companyId).all();
@@ -282,6 +385,7 @@ export default {
 		if (request.method === "POST" && url.pathname === "/memos") {
 			const body = await request.json();
 			const { company_id, content } = body;
+			if (!(await ownsCompany(company_id))) return notFound();
 
 			await env.DB.prepare(
 				"INSERT INTO memos (company_id, content) VALUES (?, ?)"
@@ -295,7 +399,9 @@ export default {
 		// DELETE /memos/:id : メモを削除
 		if (request.method === "DELETE" && url.pathname.startsWith("/memos/")) {
 			const id = url.pathname.split("/")[2];
-			await env.DB.prepare("DELETE FROM memos WHERE id = ?").bind(id).run();
+			await env.DB.prepare(
+				"DELETE FROM memos WHERE id = ? AND company_id IN (SELECT id FROM companies WHERE user_id = ?)"
+			).bind(id, userId).run();
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
@@ -306,30 +412,29 @@ export default {
 			const { content } = body;
 
 			await env.DB.prepare(
-				"UPDATE memos SET content = ? WHERE id = ?"
-			).bind(content, id).run();
+				"UPDATE memos SET content = ? WHERE id = ? AND company_id IN (SELECT id FROM companies WHERE user_id = ?)"
+			).bind(content, id, userId).run();
 
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
-		// GET /desired-conditions : 希望条件の一覧を取得
+		// GET /desired-conditions : 自分の希望条件の一覧を取得
 		if (request.method === "GET" && url.pathname === "/desired-conditions") {
 			const { results } = await env.DB.prepare(
-				"SELECT * FROM desired_conditions ORDER BY sort_order ASC, created_at ASC"
-			).all();
+				"SELECT * FROM desired_conditions WHERE user_id = ? ORDER BY sort_order ASC, created_at ASC"
+			).bind(userId).all();
 			return Response.json(results, { headers: corsHeaders });
 		}
 
 		// POST /desired-conditions : 希望条件を1件追加（例: "リモート勤務"）
-		// 並び順は「今まで登録した数」を使い、常に一番最後に追加されるようにする
+		// 並び順は「自分が今まで登録した数」を使い、常に一番最後に追加されるようにする
 		if (request.method === "POST" && url.pathname === "/desired-conditions") {
 			const body = await request.json();
 			const { label } = body;
-			const userId = "dummy_user_123"; // companiesと同じく仮のユーザーID
 
 			const countRow = await env.DB.prepare(
-				"SELECT COUNT(*) AS cnt FROM desired_conditions"
-			).first();
+				"SELECT COUNT(*) AS cnt FROM desired_conditions WHERE user_id = ?"
+			).bind(userId).first();
 
 			await env.DB.prepare(
 				"INSERT INTO desired_conditions (user_id, label, sort_order) VALUES (?, ?, ?)"
@@ -343,11 +448,14 @@ export default {
 		if (request.method === "PATCH" && url.pathname === "/desired-conditions/reorder") {
 			const body = await request.json();
 			const { order } = body;
+			if (!Array.isArray(order)) {
+				return Response.json({ error: "orderは配列で指定してください" }, { status: 400, headers: corsHeaders });
+			}
 
 			for (let i = 0; i < order.length; i++) {
 				await env.DB.prepare(
-					"UPDATE desired_conditions SET sort_order = ? WHERE id = ?"
-				).bind(i, order[i]).run();
+					"UPDATE desired_conditions SET sort_order = ? WHERE id = ? AND user_id = ?"
+				).bind(i, order[i], userId).run();
 			}
 
 			return Response.json({ success: true }, { headers: corsHeaders });
@@ -360,8 +468,8 @@ export default {
 			const { label } = body;
 
 			await env.DB.prepare(
-				"UPDATE desired_conditions SET label = ? WHERE id = ?"
-			).bind(label, id).run();
+				"UPDATE desired_conditions SET label = ? WHERE id = ? AND user_id = ?"
+			).bind(label, id, userId).run();
 
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
@@ -369,7 +477,9 @@ export default {
 		// DELETE /desired-conditions/:id : 希望条件を1件削除
 		if (request.method === "DELETE" && url.pathname.startsWith("/desired-conditions/")) {
 			const id = url.pathname.split("/")[2];
-			await env.DB.prepare("DELETE FROM desired_conditions WHERE id = ?").bind(id).run();
+			await env.DB.prepare(
+				"DELETE FROM desired_conditions WHERE id = ? AND user_id = ?"
+			).bind(id, userId).run();
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
@@ -406,6 +516,8 @@ export default {
 		// GET /requirement-matches?company_id=1 : 照合結果の一覧を取得
 		if (request.method === "GET" && url.pathname === "/requirement-matches") {
 			const companyId = url.searchParams.get("company_id");
+			if (!(await ownsCompany(companyId))) return notFound();
+
 			// requirement_matches と desired_conditions を「条件の名前」で結びつけて取得する
 			// 並び順は希望条件側のsort_orderに合わせる（希望条件の並びを変えると、ここも連動する）
 			const { results } = await env.DB.prepare(
@@ -426,8 +538,9 @@ export default {
 			const { mark } = body;
 
 			await env.DB.prepare(
-				"UPDATE requirement_matches SET mark = ?, manually_edited = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-			).bind(mark, id).run();
+				`UPDATE requirement_matches SET mark = ?, manually_edited = 1, updated_at = CURRENT_TIMESTAMP
+				 WHERE id = ? AND company_id IN (SELECT id FROM companies WHERE user_id = ?)`
+			).bind(mark, id, userId).run();
 
 			return Response.json({ success: true, mark }, { headers: corsHeaders });
 		}
@@ -438,22 +551,24 @@ export default {
 			const body = await request.json();
 			const { company_id } = body;
 
-			// 1. 対象企業の求人票本文を取得
+			// 1. 対象企業の求人票本文を取得（自分の企業でなければ「見つかりません」）
 			const company = await env.DB.prepare(
-				"SELECT job_text, selection_flow_manually_edited FROM companies WHERE id = ?"
-			).bind(company_id).first();
+				"SELECT job_text, selection_flow_manually_edited FROM companies WHERE id = ? AND user_id = ?"
+			).bind(company_id, userId).first();
 
-			if (!company || !company.job_text) {
+			if (!company) return notFound();
+
+			if (!company.job_text) {
 				return Response.json(
 					{ error: "求人票の本文が登録されていません" },
 					{ status: 400, headers: corsHeaders }
 				);
 			}
 
-			// 2. あなたの希望条件リストを取得
+			// 2. 自分の希望条件リストを取得
 			const { results: conditions } = await env.DB.prepare(
-				"SELECT id, label FROM desired_conditions ORDER BY created_at ASC"
-			).all();
+				"SELECT id, label FROM desired_conditions WHERE user_id = ? ORDER BY created_at ASC"
+			).bind(userId).all();
 
 			if (conditions.length === 0) {
 				return Response.json(
@@ -566,8 +681,8 @@ ${selectionFlowRule}
 			// ただし、すでに手動で編集済みの場合は、AIの抽出結果で上書きしない（スキップする）
 			if (!company.selection_flow_manually_edited) {
 				await env.DB.prepare(
-					"UPDATE companies SET selection_flow = ?, selection_flow_manually_edited = 0 WHERE id = ?"
-				).bind(selectionFlow, company_id).run();
+					"UPDATE companies SET selection_flow = ?, selection_flow_manually_edited = 0 WHERE id = ? AND user_id = ?"
+				).bind(selectionFlow, company_id, userId).run();
 			}
 
 			// 6. AI再照合したこと自体も記録する（記録には残すが、成長段階の判定には使わない）
@@ -579,6 +694,8 @@ ${selectionFlowRule}
 		// GET /ai-suggestions?company_id=1 : 未採用のAI提案（選考メモの候補）を取得
 		if (request.method === "GET" && url.pathname === "/ai-suggestions") {
 			const companyId = url.searchParams.get("company_id");
+			if (!(await ownsCompany(companyId))) return notFound();
+
 			const { results } = await env.DB.prepare(
 				"SELECT * FROM ai_suggestions WHERE company_id = ? ORDER BY id ASC"
 			).bind(companyId).all();
@@ -588,45 +705,53 @@ ${selectionFlowRule}
 		// DELETE /ai-suggestions/:id : AI提案を1件消す（採用した時・不要な時どちらも使う）
 		if (request.method === "DELETE" && url.pathname.startsWith("/ai-suggestions/")) {
 			const id = url.pathname.split("/")[2];
-			await env.DB.prepare("DELETE FROM ai_suggestions WHERE id = ?").bind(id).run();
+			await env.DB.prepare(
+				"DELETE FROM ai_suggestions WHERE id = ? AND company_id IN (SELECT id FROM companies WHERE user_id = ?)"
+			).bind(id, userId).run();
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
 		// GET /records?company_id=1 : 特定の企業の記録一覧（詳細画面のタイムライン用）
-		// GET /records : 全企業分の最新の記録（記録画面の「最近の記録」用）
+		// GET /records : 自分の全企業分の最新の記録（記録画面の「最近の記録」用）
 		if (request.method === "GET" && url.pathname === "/records") {
 			const companyId = url.searchParams.get("company_id");
 
 			if (companyId) {
+				if (!(await ownsCompany(companyId))) return notFound();
+
 				const { results } = await env.DB.prepare(
 					"SELECT * FROM records WHERE company_id = ? ORDER BY created_at DESC, id DESC"
 				).bind(companyId).all();
 				return Response.json(results, { headers: corsHeaders });
 			}
 
-			// company_idの指定がなければ、全企業分を新しい順に取得
+			// company_idの指定がなければ、自分の全企業分を新しい順に取得
 			// （ホーム画面から「その企業の詳細」に飛べるよう、company_idも一緒に返す）
 			const { results } = await env.DB.prepare(
 				`SELECT r.id, r.category, r.title, r.note, r.created_at, c.id AS company_id, c.company_name
 				 FROM records r
 				 JOIN companies c ON r.company_id = c.id
+				 WHERE c.user_id = ?
 				 ORDER BY r.created_at DESC, r.id DESC
 				 LIMIT 20`
-			).all();
+			).bind(userId).all();
 			return Response.json(results, { headers: corsHeaders });
 		}
 
-		// GET /export : すべてのデータをJSON形式でまとめて取得する（バックアップ用）
+		// GET /export : 自分のデータをJSON形式でまとめて取得する（バックアップ用）
 		if (request.method === "GET" && url.pathname === "/export") {
+			// 「自分の企業に紐づくものだけ」を取り出すための条件（各テーブル共通）
+			const ownCompanyIds = "(SELECT id FROM companies WHERE user_id = ?)";
+
 			const [companiesData, impressionsData, honneData, memosData, conditionsData, matchesData, recordsData] =
 				await Promise.all([
-					env.DB.prepare("SELECT * FROM companies").all(),
-					env.DB.prepare("SELECT * FROM impressions").all(),
-					env.DB.prepare("SELECT * FROM honne").all(),
-					env.DB.prepare("SELECT * FROM memos").all(),
-					env.DB.prepare("SELECT * FROM desired_conditions").all(),
-					env.DB.prepare("SELECT * FROM requirement_matches").all(),
-					env.DB.prepare("SELECT * FROM records").all(),
+					env.DB.prepare("SELECT * FROM companies WHERE user_id = ?").bind(userId).all(),
+					env.DB.prepare(`SELECT * FROM impressions WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
+					env.DB.prepare(`SELECT * FROM honne WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
+					env.DB.prepare(`SELECT * FROM memos WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
+					env.DB.prepare("SELECT * FROM desired_conditions WHERE user_id = ?").bind(userId).all(),
+					env.DB.prepare(`SELECT * FROM requirement_matches WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
+					env.DB.prepare(`SELECT * FROM records WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
 				]);
 
 			return Response.json({
@@ -641,21 +766,26 @@ ${selectionFlowRule}
 			}, { headers: corsHeaders });
 		}
 
-		// DELETE /all-data : すべてのデータを削除する（確認画面を経てからのみ呼び出す想定）
+		// DELETE /all-data : 自分のデータだけをすべて削除する（確認画面を経てからのみ呼び出す想定）
+		// 企業を消す前に、企業に紐づくデータを先に消す必要があるため、batchで順番どおりにまとめて実行する
+		// （途中で失敗した場合は、全体がなかったことになる）
 		if (request.method === "DELETE" && url.pathname === "/all-data") {
-			await Promise.all([
-				env.DB.prepare("DELETE FROM impressions").run(),
-				env.DB.prepare("DELETE FROM honne").run(),
-				env.DB.prepare("DELETE FROM memos").run(),
-				env.DB.prepare("DELETE FROM requirement_matches").run(),
-				env.DB.prepare("DELETE FROM records").run(),
-				env.DB.prepare("DELETE FROM ai_suggestions").run(),
-				env.DB.prepare("DELETE FROM desired_conditions").run(),
-				env.DB.prepare("DELETE FROM companies").run(),
+			const ownCompanyIds = "(SELECT id FROM companies WHERE user_id = ?)";
+
+			await env.DB.batch([
+				env.DB.prepare(`DELETE FROM impressions WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+				env.DB.prepare(`DELETE FROM honne WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+				env.DB.prepare(`DELETE FROM memos WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+				env.DB.prepare(`DELETE FROM requirement_matches WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+				env.DB.prepare(`DELETE FROM records WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+				env.DB.prepare(`DELETE FROM ai_suggestions WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+				env.DB.prepare("DELETE FROM desired_conditions WHERE user_id = ?").bind(userId),
+				env.DB.prepare("DELETE FROM companies WHERE user_id = ?").bind(userId),
 			]);
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
-		return new Response("Mebae API is running!", { status: 200, headers: corsHeaders });
+		// どのルートにも当てはまらなかった場合
+		return Response.json({ error: "見つかりません" }, { status: 404, headers: corsHeaders });
 	},
 };

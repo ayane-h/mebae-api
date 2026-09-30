@@ -12,5 +12,8 @@
     "@cloudflare/vitest-plugin": "^1.0.0",
     "vitest": "~4.1.0",
     "wrangler": "^4.128.0"
+  },
+  "dependencies": {
+    "@clerk/backend": "^3.20.1"
   }
 }
