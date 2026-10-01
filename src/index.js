@@ -1,4 +1,5 @@
-import { verifyToken } from "@clerk/backend";
+import { verifyToken, createClerkClient } from "@clerk/backend";
+import { seedDemoData } from "./demo.js";
 
 // バイト列を16進数の文字列に変換する（結果を見やすく表示するための補助関数）
 function bytesToHex(bytes) {
@@ -12,11 +13,16 @@ function bytesToHex(bytes) {
 const ALLOWED_FRONTEND_ORIGINS = [
 	"http://localhost:5173",
 	"http://127.0.0.1:5173",
-	"https://mebae-app.vercel.app",
+	"https://mebae-app.vercel.app", // 本番（Vercel）※最後に「/」を付けない
 ];
 
 // 企業一覧の1行に収まる、ひとことメモの最大文字数（フロントエンド側と同じ値にしておく）
 const SHORT_MEMO_MAX = 10;
+
+// ---- デモ（「🌱 デモで試してみる」）の設定 ----
+const DEMO_REMATCH_LIMIT = 3;  // デモの人がAI照合を使える回数
+const DEMO_DAILY_LIMIT = 20;   // 1日に作れるデモの数（ボタンの連打などで、Clerkのユーザーが増えすぎないように）
+const DEMO_TOTAL_LIMIT = 80;   // デモの合計の上限（ClerkのDevelopment環境は100ユーザーまでなので、自分の分の余裕を残す）
 
 // ---- 認証：リクエストに添えられたClerkのトークンを検証して、ログイン中のユーザーIDを返す ----
 // 本物のトークンなら user_xxxxx のようなIDを返し、無い・偽物・期限切れなら null を返す
@@ -77,6 +83,53 @@ export default {
 			return new Response("Mebae API is running!", { status: 200, headers: corsHeaders });
 		}
 
+		// POST /demo/start : デモ用のユーザーと見本データを作り、ログイン用の「1回限りの合言葉」を返す
+		// （まだログインしていない人が押すボタンなので、ログイン確認より前に置いている）
+		if (request.method === "POST" && url.pathname === "/demo/start") {
+			// 使いすぎ防止：1日の数・合計の数が上限に達していたら、新しいデモは作らない
+			const daily = await env.DB.prepare(
+				"SELECT COUNT(*) AS cnt FROM demo_users WHERE created_at >= datetime('now', '-1 day')"
+			).first();
+			const total = await env.DB.prepare("SELECT COUNT(*) AS cnt FROM demo_users").first();
+			if (daily.cnt >= DEMO_DAILY_LIMIT || total.cnt >= DEMO_TOTAL_LIMIT) {
+				return Response.json(
+					{ error: "ただいまデモが混み合っています。時間をおいてお試しください" },
+					{ status: 429, headers: corsHeaders }
+				);
+			}
+
+			try {
+				const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+
+				// 1. Clerkにデモ用のユーザーを作る（メールアドレスは架空のもの。パスワードは不要）
+				const suffix = crypto.randomUUID().slice(0, 8);
+				const demoUser = await clerk.users.createUser({
+					emailAddress: [`demo-${suffix}@example.com`],
+					firstName: "デモ",
+					skipPasswordRequirement: true,
+					publicMetadata: { demo: true },
+				});
+
+				// 2. 「この人はデモの人」と記録し、見本データを入れる
+				await env.DB.prepare("INSERT INTO demo_users (user_id) VALUES (?)").bind(demoUser.id).run();
+				await seedDemoData(env, demoUser.id);
+
+				// 3. 入力なしで1回だけログインできる合言葉（Sign-in Token）を発行する（5分で期限切れ）
+				const signInToken = await clerk.signInTokens.createSignInToken({
+					userId: demoUser.id,
+					expiresInSeconds: 300,
+				});
+
+				return Response.json({ ticket: signInToken.token }, { headers: corsHeaders });
+			} catch (err) {
+				console.error("デモの準備に失敗しました:", err.message, JSON.stringify(err.errors || ""));
+				return Response.json(
+					{ error: "デモの準備に失敗しました。時間をおいてお試しください" },
+					{ status: 500, headers: corsHeaders }
+				);
+			}
+		}
+
 		// ---- ここから先は、ログインしている人だけが使える ----
 		const userId = await getUserId(request, env);
 		if (!userId) {
@@ -87,6 +140,23 @@ export default {
 		// （「他人のデータがある」ことを教えないよう、403ではなく404にしている）
 		const notFound = () =>
 			Response.json({ error: "見つかりません" }, { status: 404, headers: corsHeaders });
+
+		// ログイン中の人がデモの人なら、そのデモの情報（AI照合の使用回数など）を返す。デモでなければ null
+		async function getDemoUser() {
+			return await env.DB.prepare(
+				"SELECT user_id, rematch_count FROM demo_users WHERE user_id = ?"
+			).bind(userId).first();
+		}
+
+		// GET /me : ログイン中の人の情報（デモかどうか・AI照合の残り回数）
+		if (request.method === "GET" && url.pathname === "/me") {
+			const demo = await getDemoUser();
+			return Response.json({
+				is_demo: !!demo,
+				rematch_limit: DEMO_REMATCH_LIMIT,
+				rematch_remaining: demo ? Math.max(0, DEMO_REMATCH_LIMIT - demo.rematch_count) : null,
+			}, { headers: corsHeaders });
+		}
 
 		// この企業は、ログイン中のユーザー本人のものか？を確認する
 		async function ownsCompany(companyId) {
@@ -492,32 +562,67 @@ export default {
 
 		// ---- Geminiを呼び出す共通処理 ----
 		// promptで質問を投げて、返ってきたJSONをそのままオブジェクトとして受け取る
+		// Geminiが混雑している時（503など）は失敗しやすいので、少し待って最大3回までやり直す
 		async function callGemini(prompt, apiKey) {
-			const response = await fetch(
-				"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
-				{
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-						"x-goog-api-key": apiKey,
-					},
-					body: JSON.stringify({
-						contents: [{ parts: [{ text: prompt }] }],
-						generationConfig: {
-							responseMimeType: "application/json", // JSON形式だけを返してもらう指定
-						},
-					}),
+			const RETRYABLE_STATUS = [429, 500, 503]; // やり直せば成功する可能性があるエラー
+			const MAX_ATTEMPTS = 3;
+			let lastError;
+
+			for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+				try {
+					const response = await fetch(
+						"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+						{
+							method: "POST",
+							headers: {
+								"Content-Type": "application/json",
+								"x-goog-api-key": apiKey,
+							},
+							body: JSON.stringify({
+								contents: [{ parts: [{ text: prompt }] }],
+								generationConfig: {
+									responseMimeType: "application/json", // JSON形式だけを返してもらう指定
+								},
+							}),
+						}
+					);
+
+					if (!response.ok) {
+						const errText = await response.text();
+						const err = new Error(`Gemini API error: ${response.status} ${errText}`);
+						err.status = response.status;
+						err.retryable = RETRYABLE_STATUS.includes(response.status);
+						throw err;
+					}
+
+					// 返事の中身を、途中が欠けていても壊れないように取り出す
+					const data = await response.json();
+					const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+					if (!text) {
+						const err = new Error("Geminiの返事に本文がありませんでした");
+						err.kind = "bad_response";
+						err.retryable = true;
+						throw err;
+					}
+					try {
+						return JSON.parse(text); // 文字列のJSONを、扱いやすいオブジェクトに変換
+					} catch {
+						const err = new Error("Geminiの返事がJSONの形になっていませんでした");
+						err.kind = "bad_response";
+						err.retryable = true;
+						throw err;
+					}
+				} catch (err) {
+					lastError = err;
+					// 通信そのものの失敗（statusが無いエラー）も、やり直す対象にする
+					const retryable = err.retryable ?? true;
+					if (!retryable || attempt === MAX_ATTEMPTS) break;
+
+					console.warn(`Geminiの呼び出しに失敗しました（${attempt}回目）。やり直します:`, err.message);
+					await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** (attempt - 1))); // 1秒 → 2秒 と待つ
 				}
-			);
-
-			if (!response.ok) {
-				const errText = await response.text();
-				throw new Error(`Gemini API error: ${response.status} ${errText}`);
 			}
-
-			const data = await response.json();
-			const text = data.candidates[0].content.parts[0].text;
-			return JSON.parse(text); // 文字列のJSONを、扱いやすいオブジェクトに変換
+			throw lastError;
 		}
 
 		// GET /requirement-matches?company_id=1 : 照合結果の一覧を取得
@@ -558,6 +663,15 @@ export default {
 			const body = await request.json();
 			const { company_id } = body;
 
+			// 0. デモの人は、AI照合を使える回数に上限がある
+			const demoUser = await getDemoUser();
+			if (demoUser && demoUser.rematch_count >= DEMO_REMATCH_LIMIT) {
+				return Response.json(
+					{ error: `デモでのAI照合は${DEMO_REMATCH_LIMIT}回までです`, code: "demo_limit" },
+					{ status: 429, headers: corsHeaders }
+				);
+			}
+
 			// 1. 対象企業の求人票本文を取得（自分の企業でなければ「見つかりません」）
 			const company = await env.DB.prepare(
 				"SELECT job_text, selection_flow_manually_edited FROM companies WHERE id = ? AND user_id = ?"
@@ -567,7 +681,7 @@ export default {
 
 			if (!company.job_text) {
 				return Response.json(
-					{ error: "求人票の本文が登録されていません" },
+					{ error: "求人票の本文が登録されていません", code: "no_job_text" },
 					{ status: 400, headers: corsHeaders }
 				);
 			}
@@ -579,7 +693,7 @@ export default {
 
 			if (conditions.length === 0) {
 				return Response.json(
-					{ error: "希望条件が1件も登録されていません" },
+					{ error: "希望条件が1件も登録されていません", code: "no_conditions" },
 					{ status: 400, headers: corsHeaders }
 				);
 			}
@@ -651,10 +765,31 @@ ${selectionFlowRule}
 			try {
 				aiResult = await callGemini(prompt, env.GEMINI_API_KEY);
 			} catch (err) {
+				console.error("AIによる照合に失敗しました:", err.message);
+
+				// 失敗の理由を、画面で出し分けられるように分類する
+				// ai_quota：回数制限（429） / ai_busy：混雑・通信の失敗 / ai_failed：それ以外
+				let code = "ai_failed";
+				let status = 500;
+				if (err.status === 429) {
+					code = "ai_quota";
+					status = 429;
+				} else if (err.status === 500 || err.status === 503 || (err.status === undefined && err.kind !== "bad_response")) {
+					code = "ai_busy";
+					status = 503;
+				}
+
 				return Response.json(
-					{ error: "AIによる照合に失敗しました", detail: err.message },
-					{ status: 500, headers: corsHeaders }
+					{ error: "AIによる照合に失敗しました", code, detail: err.message },
+					{ status, headers: corsHeaders }
 				);
+			}
+
+			// AI照合が成功したので、デモの人の使用回数を1つ増やす（失敗した時は数えない）
+			if (demoUser) {
+				await env.DB.prepare(
+					"UPDATE demo_users SET rematch_count = rematch_count + 1 WHERE user_id = ?"
+				).bind(userId).run();
 			}
 
 			const aiResults = aiResult.matches || [];
