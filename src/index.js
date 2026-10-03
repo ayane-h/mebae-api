@@ -20,6 +20,10 @@ const ALLOWED_FRONTEND_ORIGINS = [
 const SHORT_MEMO_MAX = 10;
 
 // ---- デモ（「🌱 デモで試してみる」）の設定 ----
+// 選考ステータスを押し間違えた時に、「押し直し」として扱う時間（分）
+// この時間内の押し直しは、記録を増やさずに、直前の記録を書き換える（または取り消す）
+const STATUS_UNDO_MINUTES = 10;
+
 const DEMO_REMATCH_LIMIT = 3;  // デモの人がAI照合を使える回数
 const DEMO_DAILY_LIMIT = 20;   // 1日に作れるデモの数（ボタンの連打などで、Clerkのユーザーが増えすぎないように）
 const DEMO_TOTAL_LIMIT = 80;   // デモの合計の上限（ClerkのDevelopment環境は100ユーザーまでなので、自分の分の余裕を残す）
@@ -332,14 +336,63 @@ export default {
 			values.push(id);
 			values.push(userId);
 
+			// ステータスの記録を正しく残すために、更新する前のステータスを控えておく
+			let statusBefore = null;
+			if (body.status !== undefined) {
+				const row = await env.DB.prepare(
+					"SELECT status FROM companies WHERE id = ? AND user_id = ?"
+				).bind(id, userId).first();
+				statusBefore = row ? row.status : null;
+			}
+
 			await env.DB.prepare(
 				`UPDATE companies SET ${fields.join(", ")} WHERE id = ? AND user_id = ?`
 			).bind(...values).run();
 
 			// ステータスが変わった時だけ記録する（志望度の星だけの変更では記録しない）
 			// タイトルにステータス名そのものを使う（例:"一次面接"）
-			if (body.status !== undefined) {
-				await addRecord(env, id, "status", body.status);
+			// 今と同じステータスを押しただけの時は、何も記録しない
+			if (body.status !== undefined && body.status !== statusBefore) {
+				// この企業の一番新しい記録を調べる（recent は「STATUS_UNDO_MINUTES分以内か」を 1 / 0 で返す）
+				const last = await env.DB.prepare(
+					`SELECT id, category, (created_at >= datetime('now', ?)) AS recent
+					 FROM records WHERE company_id = ?
+					 ORDER BY created_at DESC, id DESC LIMIT 1`
+				).bind(`-${STATUS_UNDO_MINUTES} minutes`, id).first();
+
+				if (last && last.category === "status" && last.recent) {
+					// 直前の記録がステータス変更で、まだ時間が経っていない → 押し間違いの「押し直し」として扱う
+					// 押し間違える前のステータス（1つ前のステータスの記録。無ければ、最初の「応募前」）を調べる
+					const prev = await env.DB.prepare(
+						`SELECT title FROM records
+						 WHERE company_id = ? AND category = 'status' AND id != ?
+						 ORDER BY created_at DESC, id DESC LIMIT 1`
+					).bind(id, last.id).first();
+					const originalStatus = prev ? prev.title : "応募前";
+
+					if (body.status === originalStatus) {
+						// 元のステータスに戻した → 押し間違いの記録ごと取り消す
+						await env.DB.prepare("DELETE FROM records WHERE id = ?").bind(last.id).run();
+					} else {
+						// 別のステータスに押し直した → 記録を増やさず、直前の記録を書き換える
+						await env.DB.prepare(
+							"UPDATE records SET title = ?, created_at = CURRENT_TIMESTAMP WHERE id = ?"
+						).bind(body.status, last.id).run();
+					}
+				} else {
+					await addRecord(env, id, "status", body.status);
+				}
+			}
+
+			// 求人票の本文を、あとから追加した場合も「求人を知る」として数える
+			// （まだ求人票の記録が1件もない企業に、本文が入った時だけ記録する。2回目以降は記録しない）
+			if (typeof body.job_text === "string" && body.job_text.trim()) {
+				const existing = await env.DB.prepare(
+					"SELECT id FROM records WHERE company_id = ? AND category = 'job_text' LIMIT 1"
+				).bind(id).first();
+				if (!existing) {
+					await addRecord(env, id, "job_text", "求人票を追加");
+				}
 			}
 
 			return Response.json({ success: true }, { headers: corsHeaders });
