@@ -219,23 +219,30 @@ export default {
 
 			// 自分の企業のrecordsだけを、一度にまとめて取得する
 			const { results: allRecords } = await env.DB.prepare(
-				`SELECT r.company_id, r.category
+				`SELECT r.company_id, r.category, r.created_at
 				 FROM records r
 				 JOIN companies c ON r.company_id = c.id
 				 WHERE c.user_id = ?`
 			).bind(userId).all();
 
-			// company_idごとに、カテゴリの配列をまとめる
+			// company_idごとに、カテゴリの配列と、いちばん新しい記録の日時をまとめる
 			const categoriesByCompany = {};
+			const lastActivityByCompany = {};
 			for (const r of allRecords) {
 				if (!categoriesByCompany[r.company_id]) categoriesByCompany[r.company_id] = [];
 				categoriesByCompany[r.company_id].push(r.category);
+
+				if (!lastActivityByCompany[r.company_id] || r.created_at > lastActivityByCompany[r.company_id]) {
+					lastActivityByCompany[r.company_id] = r.created_at;
+				}
 			}
 
-			// 各企業オブジェクトに growth_stage というフィールドを追加する
+			// 各企業オブジェクトに、成長段階(growth_stage)と、最後に記録した日時(last_activity_at)を追加する
+			// （last_activity_at は、「しばらく記録がありません」の案内に使う。記録が1件も無ければ、植えた日時）
 			const companiesWithStage = companies.map((c) => ({
 				...c,
 				growth_stage: calcGrowthStage(categoriesByCompany[c.id] || []),
+				last_activity_at: lastActivityByCompany[c.id] || c.created_at,
 			}));
 
 			return Response.json(companiesWithStage, { headers: corsHeaders });
