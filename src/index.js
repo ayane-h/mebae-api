@@ -18,6 +18,10 @@ const ALLOWED_FRONTEND_ORIGINS = [
 
 // 企業一覧の1行に収まる、ひとことメモの最大文字数（フロントエンド側と同じ値にしておく）
 const SHORT_MEMO_MAX = 10;
+// 選考フローの最大文字数（複数行で書けるようにしたので、長すぎるものは断る）
+const SELECTION_FLOW_MAX = 1000;
+// 求人ページのURLの最大文字数
+const JOB_URL_MAX = 2000;
 
 // ---- デモ（「🌱 デモで試してみる」）の設定 ----
 // 選考ステータスを押し間違えた時に、「押し直し」として扱う時間（分）
@@ -243,6 +247,9 @@ export default {
 				...c,
 				growth_stage: calcGrowthStage(categoriesByCompany[c.id] || []),
 				last_activity_at: lastActivityByCompany[c.id] || c.created_at,
+				// すでに記録したことのある種類（job_text / impression / honne / memo のうち、記録が残っているもの）
+				// 企業詳細の「問いかけカード」で、まだ書いていない種類を選ぶために使う
+				recorded_kinds: [...new Set((categoriesByCompany[c.id] || []).filter((cat) => GROWTH_BUCKETS[cat]))],
 			}));
 
 			return Response.json(companiesWithStage, { headers: corsHeaders });
@@ -313,26 +320,47 @@ export default {
 				values.push(memo || null);
 			}
 			if (body.job_text !== undefined) {
-				// 求人票の中身が実際に変わったかどうかを確認する
-				// （変わっていれば、手動編集済みの選考フローもAIに見直させたいのでリセットする）
-				const current = await env.DB.prepare(
-					"SELECT job_text FROM companies WHERE id = ? AND user_id = ?"
-				).bind(id, userId).first();
-				const jobTextChanged = !current || current.job_text !== body.job_text;
-
+				// 求人票の本文を保存する
+				// （以前は、本文が変わると「選考フローは手動で編集済み」の印を外していたが、
+				//   誤字を1文字直しただけでも手入力した選考フローがAIに上書きされてしまうため、やめた。
+				//   手入力した選考フローは、本人が空にするまでずっと残す）
 				fields.push("job_text = ?");
 				values.push(body.job_text);
-
-				if (jobTextChanged) {
-					fields.push("selection_flow_manually_edited = ?");
-					values.push(0);
+			}
+			if (body.job_url !== undefined) {
+				// 求人ページのURL。前後の空白を取り除き、空ならnull（URLなし）として保存する
+				const jobUrl = String(body.job_url || "").trim();
+				// 画面ではリンクとして開くので、http:// か https:// で始まるものだけ受け付ける
+				if (jobUrl && !/^https?:\/\//i.test(jobUrl)) {
+					return Response.json(
+						{ error: "求人ページのURLは、http:// か https:// から始まる形で入力してください" },
+						{ status: 400, headers: corsHeaders }
+					);
 				}
+				if (jobUrl.length > JOB_URL_MAX) {
+					return Response.json(
+						{ error: "求人ページのURLが長すぎます" },
+						{ status: 400, headers: corsHeaders }
+					);
+				}
+				fields.push("job_url = ?");
+				values.push(jobUrl || null);
 			}
 			if (body.selection_flow !== undefined) {
+				// 選考フロー（複数行で書ける）。前後の空白・改行を取り除く
+				const flow = String(body.selection_flow || "").trim();
+				if (flow.length > SELECTION_FLOW_MAX) {
+					return Response.json(
+						{ error: `選考フローは${SELECTION_FLOW_MAX}文字以内で入力してください` },
+						{ status: 400, headers: corsHeaders }
+					);
+				}
+				// 中身があれば「手動で編集済み」の印を立てる（AI照合で上書きされなくなる）
+				// 空にして保存した時は印を外す（次のAI照合で、求人票から読み取り直してもらえる）
 				fields.push("selection_flow = ?");
 				fields.push("selection_flow_manually_edited = ?");
-				values.push(body.selection_flow);
-				values.push(1);
+				values.push(flow || null);
+				values.push(flow ? 1 : 0);
 			}
 
 			// 更新する項目が1つもなければ、何もせずに成功を返す
@@ -769,7 +797,7 @@ export default {
 			// 3. Geminiに渡す質問文（プロンプト）を組み立てる
 			const conditionLabels = conditions.map((c) => c.label).join("、");
 
-			// 選考フローが手動編集済み（かつ求人票も変わっていない）なら、
+			// 選考フローが手動編集済みなら、
 			// AIに選考フローを考えさせること自体を省略する（時間・コストの節約）
 			const needsSelectionFlow = !company.selection_flow_manually_edited;
 
