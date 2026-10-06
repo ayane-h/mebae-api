@@ -22,6 +22,9 @@ const SHORT_MEMO_MAX = 10;
 const SELECTION_FLOW_MAX = 1000;
 // 求人ページのURLの最大文字数
 const JOB_URL_MAX = 2000;
+// 関連リンク（採用ページ・企業HPなど）の、名前の最大文字数と、1社あたりの件数の上限
+const LINK_LABEL_MAX = 20;
+const LINKS_PER_COMPANY_MAX = 10;
 
 // ---- デモ（「🌱 デモで試してみる」）の設定 ----
 // 選考ステータスを押し間違えた時に、「押し直し」として扱う時間（分）
@@ -31,6 +34,8 @@ const STATUS_UNDO_MINUTES = 10;
 const DEMO_REMATCH_LIMIT = 3;  // デモの人がAI照合を使える回数
 const DEMO_DAILY_LIMIT = 20;   // 1日に作れるデモの数（ボタンの連打などで、Clerkのユーザーが増えすぎないように）
 const DEMO_TOTAL_LIMIT = 80;   // デモの合計の上限（ClerkのDevelopment環境は100ユーザーまでなので、自分の分の余裕を残す）
+const DEMO_KEEP_DAYS = 3;        // デモを残しておく日数（これより古いデモは、自動で片づける）
+const DEMO_CLEANUP_BATCH = 10;   // 1回の片づけで消す人数の上限（一度にたくさん処理して、制限に当たらないように）
 
 // ---- 認証：リクエストに添えられたClerkのトークンを検証して、ログイン中のユーザーIDを返す ----
 // 本物のトークンなら user_xxxxx のようなIDを返し、無い・偽物・期限切れなら null を返す
@@ -67,6 +72,69 @@ async function getUserId(request, env) {
 		console.error("トークンの検証に失敗しました:", err.message);
 		return null;
 	}
+}
+
+// ---- あるユーザーのデータを、すべて消すためのSQLをまとめて作る ----
+// 企業を消す前に、企業に紐づくデータを先に消す必要があるので、この順番で並べている
+// （「データを削除」と、古いデモの片づけの両方で使う）
+function userDataDeleteStatements(env, userId) {
+	const ownCompanyIds = "(SELECT id FROM companies WHERE user_id = ?)";
+	return [
+		env.DB.prepare(`DELETE FROM impressions WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+		env.DB.prepare(`DELETE FROM honne WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+		env.DB.prepare(`DELETE FROM memos WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+		env.DB.prepare(`DELETE FROM requirement_matches WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+		env.DB.prepare(`DELETE FROM records WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+		env.DB.prepare(`DELETE FROM ai_suggestions WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+		env.DB.prepare(`DELETE FROM company_links WHERE company_id IN ${ownCompanyIds}`).bind(userId),
+		env.DB.prepare("DELETE FROM desired_conditions WHERE user_id = ?").bind(userId),
+		env.DB.prepare("DELETE FROM companies WHERE user_id = ?").bind(userId),
+	];
+}
+
+// ---- 古いデモの片づけ ----
+// 作ってから DEMO_KEEP_DAYS 日たったデモを、古い順に消す（Clerkのユーザー数の上限対策）
+// 1人ずつ「Clerkのユーザー → D1のデータ」の順に消す。
+// Clerk側で失敗した時は、D1のデータを残しておく（次の回に、もう一度やり直せるように）
+async function cleanupOldDemoUsers(env) {
+	const { results: oldDemos } = await env.DB.prepare(
+		`SELECT user_id FROM demo_users
+		 WHERE created_at < datetime('now', ?)
+		 ORDER BY created_at ASC
+		 LIMIT ?`
+	).bind(`-${DEMO_KEEP_DAYS} days`, DEMO_CLEANUP_BATCH).all();
+
+	if (oldDemos.length === 0) return { deleted: 0, failed: 0 };
+
+	const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+	let deleted = 0;
+	let failed = 0;
+
+	for (const demo of oldDemos) {
+		try {
+			// 1. Clerkのユーザーを消す
+			try {
+				await clerk.users.deleteUser(demo.user_id);
+			} catch (err) {
+				// 404（すでにClerk側にいない）は、消し終わっているのと同じなので、そのまま先へ進む
+				if (err.status !== 404) throw err;
+			}
+
+			// 2. D1のデータと、demo_users の行をまとめて消す
+			//    （batchなので、途中で失敗した場合は、全体がなかったことになる）
+			await env.DB.batch([
+				...userDataDeleteStatements(env, demo.user_id),
+				env.DB.prepare("DELETE FROM demo_users WHERE user_id = ?").bind(demo.user_id),
+			]);
+			deleted++;
+		} catch (err) {
+			failed++;
+			console.error("古いデモの削除に失敗しました:", demo.user_id, err.message);
+		}
+	}
+
+	console.log(`古いデモの片づけ：${deleted}人を削除、${failed}人が失敗`);
+	return { deleted, failed };
 }
 
 export default {
@@ -247,9 +315,6 @@ export default {
 				...c,
 				growth_stage: calcGrowthStage(categoriesByCompany[c.id] || []),
 				last_activity_at: lastActivityByCompany[c.id] || c.created_at,
-				// すでに記録したことのある種類（job_text / impression / honne / memo のうち、記録が残っているもの）
-				// 企業詳細の「問いかけカード」で、まだ書いていない種類を選ぶために使う
-				recorded_kinds: [...new Set((categoriesByCompany[c.id] || []).filter((cat) => GROWTH_BUCKETS[cat]))],
 			}));
 
 			return Response.json(companiesWithStage, { headers: corsHeaders });
@@ -652,7 +717,8 @@ export default {
 		// promptで質問を投げて、返ってきたJSONをそのままオブジェクトとして受け取る
 		// Geminiが混雑している時（503など）は失敗しやすいので、少し待って最大3回までやり直す
 		async function callGemini(prompt, apiKey) {
-			const RETRYABLE_STATUS = [429, 500, 503]; // やり直せば成功する可能性があるエラー
+			// 429（回数の上限）は、すぐやり直しても通らないので対象から外す
+			const RETRYABLE_STATUS = [500, 503]; // やり直せば成功する可能性があるエラー（混雑など）
 			const MAX_ATTEMPTS = 3;
 			let lastError;
 
@@ -941,6 +1007,95 @@ ${selectionFlowRule}
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
+		// ---- 関連リンク（採用ページ・企業HP・別の求人など。1社にいくつでも登録できる） ----
+
+		// 関連リンクの入力を確かめて、整えた値を返す（問題があれば error に理由を入れて返す）
+		function readLinkInput(body) {
+			const label = String(body.label || "").trim();
+			const linkUrl = String(body.url || "").trim();
+			if (!label) return { error: "リンクの名前を入力してください" };
+			if (label.length > LINK_LABEL_MAX) {
+				return { error: `リンクの名前は${LINK_LABEL_MAX}文字以内で入力してください` };
+			}
+			// 画面ではリンクとして開くので、http:// か https:// で始まるものだけ受け付ける
+			if (!/^https?:\/\//i.test(linkUrl)) {
+				return { error: "URLは、http:// か https:// から始まる形で入力してください" };
+			}
+			if (linkUrl.length > JOB_URL_MAX) return { error: "URLが長すぎます" };
+			return { label, url: linkUrl };
+		}
+
+		// GET /company-links?company_id=1 : 特定の企業の関連リンクを取得（登録した順）
+		if (request.method === "GET" && url.pathname === "/company-links") {
+			const companyId = url.searchParams.get("company_id");
+			if (!(await ownsCompany(companyId))) return notFound();
+
+			const { results } = await env.DB.prepare(
+				"SELECT * FROM company_links WHERE company_id = ? ORDER BY id ASC"
+			).bind(companyId).all();
+			return Response.json(results, { headers: corsHeaders });
+		}
+
+		// POST /company-links : 関連リンクを1件追加
+		if (request.method === "POST" && url.pathname === "/company-links") {
+			const body = await request.json();
+			const { company_id } = body;
+			if (!(await ownsCompany(company_id))) return notFound();
+
+			const input = readLinkInput(body);
+			if (input.error) {
+				return Response.json({ error: input.error }, { status: 400, headers: corsHeaders });
+			}
+
+			// 1社あたりの件数に上限をつける（際限なく増えないように）
+			const countRow = await env.DB.prepare(
+				"SELECT COUNT(*) AS cnt FROM company_links WHERE company_id = ?"
+			).bind(company_id).first();
+			if (countRow.cnt >= LINKS_PER_COMPANY_MAX) {
+				return Response.json(
+					{ error: `リンクは1社につき${LINKS_PER_COMPANY_MAX}件までです` },
+					{ status: 400, headers: corsHeaders }
+				);
+			}
+
+			const result = await env.DB.prepare(
+				"INSERT INTO company_links (company_id, label, url) VALUES (?, ?, ?)"
+			).bind(company_id, input.label, input.url).run();
+
+			return Response.json(
+				{ success: true, id: result.meta.last_row_id },
+				{ status: 201, headers: corsHeaders }
+			);
+		}
+
+		// PATCH /company-links/:id : 関連リンクの名前・URLを書き直す
+		// 「自分の企業に紐づくものだけ」を対象にする条件を、SQLの中に含めている
+		if (request.method === "PATCH" && url.pathname.startsWith("/company-links/")) {
+			const id = url.pathname.split("/")[2];
+			const body = await request.json();
+
+			const input = readLinkInput(body);
+			if (input.error) {
+				return Response.json({ error: input.error }, { status: 400, headers: corsHeaders });
+			}
+
+			await env.DB.prepare(
+				`UPDATE company_links SET label = ?, url = ?
+				 WHERE id = ? AND company_id IN (SELECT id FROM companies WHERE user_id = ?)`
+			).bind(input.label, input.url, id, userId).run();
+
+			return Response.json({ success: true }, { headers: corsHeaders });
+		}
+
+		// DELETE /company-links/:id : 関連リンクを1件削除
+		if (request.method === "DELETE" && url.pathname.startsWith("/company-links/")) {
+			const id = url.pathname.split("/")[2];
+			await env.DB.prepare(
+				"DELETE FROM company_links WHERE id = ? AND company_id IN (SELECT id FROM companies WHERE user_id = ?)"
+			).bind(id, userId).run();
+			return Response.json({ success: true }, { headers: corsHeaders });
+		}
+
 		// GET /records?company_id=1 : 特定の企業の記録一覧（詳細画面のタイムライン用）
 		// GET /records : 自分の全企業分の最新の記録（記録画面の「最近の記録」用）
 		if (request.method === "GET" && url.pathname === "/records") {
@@ -973,7 +1128,7 @@ ${selectionFlowRule}
 			// 「自分の企業に紐づくものだけ」を取り出すための条件（各テーブル共通）
 			const ownCompanyIds = "(SELECT id FROM companies WHERE user_id = ?)";
 
-			const [companiesData, impressionsData, honneData, memosData, conditionsData, matchesData, recordsData] =
+			const [companiesData, impressionsData, honneData, memosData, conditionsData, matchesData, recordsData, linksData] =
 				await Promise.all([
 					env.DB.prepare("SELECT * FROM companies WHERE user_id = ?").bind(userId).all(),
 					env.DB.prepare(`SELECT * FROM impressions WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
@@ -982,6 +1137,7 @@ ${selectionFlowRule}
 					env.DB.prepare("SELECT * FROM desired_conditions WHERE user_id = ?").bind(userId).all(),
 					env.DB.prepare(`SELECT * FROM requirement_matches WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
 					env.DB.prepare(`SELECT * FROM records WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
+					env.DB.prepare(`SELECT * FROM company_links WHERE company_id IN ${ownCompanyIds}`).bind(userId).all(),
 				]);
 
 			return Response.json({
@@ -993,29 +1149,25 @@ ${selectionFlowRule}
 				desired_conditions: conditionsData.results,
 				requirement_matches: matchesData.results,
 				records: recordsData.results,
+				company_links: linksData.results,
 			}, { headers: corsHeaders });
 		}
 
 		// DELETE /all-data : 自分のデータだけをすべて削除する（確認画面を経てからのみ呼び出す想定）
-		// 企業を消す前に、企業に紐づくデータを先に消す必要があるため、batchで順番どおりにまとめて実行する
-		// （途中で失敗した場合は、全体がなかったことになる）
+		// batchで順番どおりにまとめて実行する（途中で失敗した場合は、全体がなかったことになる）
 		if (request.method === "DELETE" && url.pathname === "/all-data") {
-			const ownCompanyIds = "(SELECT id FROM companies WHERE user_id = ?)";
-
-			await env.DB.batch([
-				env.DB.prepare(`DELETE FROM impressions WHERE company_id IN ${ownCompanyIds}`).bind(userId),
-				env.DB.prepare(`DELETE FROM honne WHERE company_id IN ${ownCompanyIds}`).bind(userId),
-				env.DB.prepare(`DELETE FROM memos WHERE company_id IN ${ownCompanyIds}`).bind(userId),
-				env.DB.prepare(`DELETE FROM requirement_matches WHERE company_id IN ${ownCompanyIds}`).bind(userId),
-				env.DB.prepare(`DELETE FROM records WHERE company_id IN ${ownCompanyIds}`).bind(userId),
-				env.DB.prepare(`DELETE FROM ai_suggestions WHERE company_id IN ${ownCompanyIds}`).bind(userId),
-				env.DB.prepare("DELETE FROM desired_conditions WHERE user_id = ?").bind(userId),
-				env.DB.prepare("DELETE FROM companies WHERE user_id = ?").bind(userId),
-			]);
+			await env.DB.batch(userDataDeleteStatements(env, userId));
 			return Response.json({ success: true }, { headers: corsHeaders });
 		}
 
 		// どのルートにも当てはまらなかった場合
 		return Response.json({ error: "見つかりません" }, { status: 404, headers: corsHeaders });
+	},
+
+	// ---- 定期実行（Cron Trigger） ----
+	// 設定ファイルの crons で決めた時刻に、Cloudflareが自動でここを呼ぶ
+	// waitUntil：片づけが終わるまで、Workerを止めずに待ってもらうための指定
+	async scheduled(controller, env, ctx) {
+		ctx.waitUntil(cleanupOldDemoUsers(env));
 	},
 };

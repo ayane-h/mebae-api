@@ -90,3 +90,12 @@ CREATE TABLE IF NOT EXISTS demo_users (
     rematch_count INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 関連リンク（採用ページ・企業HP・別の求人など。1社にいくつでも登録できる）
+CREATE TABLE IF NOT EXISTS company_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    url TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);

@@ -17,7 +17,11 @@
 			"database_name": "mebae-db",
 			"database_id": "c0cf754a-acba-4f54-bb92-cc268c5b3d08"
 		}
-	]
+	],
+	// 定期実行（Cron Trigger）：1時間に1回（毎時0分）、古いデモの片づけを実行する
+	"triggers": {
+		"crons": ["0 * * * *"]
+	}
 /**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
