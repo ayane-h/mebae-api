@@ -25,6 +25,13 @@ const JOB_URL_MAX = 2000;
 // 関連リンク（採用ページ・企業HPなど）の、名前の最大文字数と、1社あたりの件数の上限
 const LINK_LABEL_MAX = 20;
 const LINKS_PER_COMPANY_MAX = 10;
+// 希望条件の件数の上限と、1件の最大文字数（フロントエンド側と同じ値にしておく）
+// 件数が多いと、照合結果の保存でデータベースの操作回数が増え、AIの返事も長くなるため
+const CONDITIONS_MAX = 10;
+const CONDITION_LABEL_MAX = 30;
+// 求人票の本文の最大文字数（フロントエンド側と同じ値にしておく）
+// AIに送る量は、ここがいちばん大きい。ページ全体を貼り付けたような、極端に長い文を防ぐ
+const JOB_TEXT_MAX = 10000;
 
 // ---- デモ（「🌱 デモで試してみる」）の設定 ----
 // 選考ステータスを押し間違えた時に、「押し直し」として扱う時間（分）
@@ -309,12 +316,31 @@ export default {
 				}
 			}
 
+			// 希望条件との照合結果（○△×）も、企業ごとにまとめておく（企業一覧に、小さな点で出すため）
+			// 希望条件の並び順（sort_order）どおりに取り出すので、配列の順番も、希望条件の並びと同じになる
+			const { results: allMarks } = await env.DB.prepare(
+				`SELECT rm.company_id, rm.mark
+				 FROM requirement_matches rm
+				 JOIN companies c ON rm.company_id = c.id
+				 JOIN desired_conditions dc ON rm.condition_id = dc.id
+				 WHERE c.user_id = ?
+				 ORDER BY dc.sort_order ASC, dc.created_at ASC`
+			).bind(userId).all();
+
+			const marksByCompany = {};
+			for (const m of allMarks) {
+				if (!marksByCompany[m.company_id]) marksByCompany[m.company_id] = [];
+				marksByCompany[m.company_id].push(m.mark);
+			}
+
 			// 各企業オブジェクトに、成長段階(growth_stage)と、最後に記録した日時(last_activity_at)を追加する
 			// （last_activity_at は、「しばらく記録がありません」の案内に使う。記録が1件も無ければ、植えた日時）
 			const companiesWithStage = companies.map((c) => ({
 				...c,
 				growth_stage: calcGrowthStage(categoriesByCompany[c.id] || []),
 				last_activity_at: lastActivityByCompany[c.id] || c.created_at,
+				// 希望条件との照合結果（"yes" | "mid" | "no" の配列）。まだ照合していなければ、空の配列
+				match_marks: marksByCompany[c.id] || [],
 			}));
 
 			return Response.json(companiesWithStage, { headers: corsHeaders });
@@ -324,6 +350,14 @@ export default {
 		if (request.method === "POST" && url.pathname === "/companies") {
 			const body = await request.json();
 			const { company_name, job_url, job_text, interest_level } = body;
+
+			// 求人票の本文が長すぎる時は、登録しない
+			if (typeof job_text === "string" && job_text.length > JOB_TEXT_MAX) {
+				return Response.json(
+					{ error: `求人票の本文は${JOB_TEXT_MAX.toLocaleString("ja-JP")}文字以内で入力してください` },
+					{ status: 400, headers: corsHeaders }
+				);
+			}
 
 			const result = await env.DB.prepare(
 				`INSERT INTO companies (user_id, company_name, job_url, job_text, interest_level)
@@ -389,6 +423,12 @@ export default {
 				// （以前は、本文が変わると「選考フローは手動で編集済み」の印を外していたが、
 				//   誤字を1文字直しただけでも手入力した選考フローがAIに上書きされてしまうため、やめた。
 				//   手入力した選考フローは、本人が空にするまでずっと残す）
+				if (typeof body.job_text === "string" && body.job_text.length > JOB_TEXT_MAX) {
+					return Response.json(
+						{ error: `求人票の本文は${JOB_TEXT_MAX.toLocaleString("ja-JP")}文字以内で入力してください` },
+						{ status: 400, headers: corsHeaders }
+					);
+				}
 				fields.push("job_text = ?");
 				values.push(body.job_text);
 			}
@@ -660,11 +700,30 @@ export default {
 		// 並び順は「自分が今まで登録した数」を使い、常に一番最後に追加されるようにする
 		if (request.method === "POST" && url.pathname === "/desired-conditions") {
 			const body = await request.json();
-			const { label } = body;
+
+			// 前後の空白を取り除いて、中身と長さを確かめる
+			const label = String(body.label || "").trim();
+			if (!label) {
+				return Response.json({ error: "希望条件を入力してください" }, { status: 400, headers: corsHeaders });
+			}
+			if (label.length > CONDITION_LABEL_MAX) {
+				return Response.json(
+					{ error: `希望条件は${CONDITION_LABEL_MAX}文字以内で入力してください` },
+					{ status: 400, headers: corsHeaders }
+				);
+			}
 
 			const countRow = await env.DB.prepare(
 				"SELECT COUNT(*) AS cnt FROM desired_conditions WHERE user_id = ?"
 			).bind(userId).first();
+
+			// 件数の上限に達していたら、追加しない
+			if (countRow.cnt >= CONDITIONS_MAX) {
+				return Response.json(
+					{ error: `希望条件は${CONDITIONS_MAX}件までです` },
+					{ status: 400, headers: corsHeaders }
+				);
+			}
 
 			await env.DB.prepare(
 				"INSERT INTO desired_conditions (user_id, label, sort_order) VALUES (?, ?, ?)"
@@ -695,7 +754,18 @@ export default {
 		if (request.method === "PATCH" && url.pathname.startsWith("/desired-conditions/")) {
 			const id = url.pathname.split("/")[2];
 			const body = await request.json();
-			const { label } = body;
+
+			// 追加の時と同じように、中身と長さを確かめる
+			const label = String(body.label || "").trim();
+			if (!label) {
+				return Response.json({ error: "希望条件を入力してください" }, { status: 400, headers: corsHeaders });
+			}
+			if (label.length > CONDITION_LABEL_MAX) {
+				return Response.json(
+					{ error: `希望条件は${CONDITION_LABEL_MAX}文字以内で入力してください` },
+					{ status: 400, headers: corsHeaders }
+				);
+			}
 
 			await env.DB.prepare(
 				"UPDATE desired_conditions SET label = ? WHERE id = ? AND user_id = ?"
