@@ -99,3 +99,9 @@ CREATE TABLE IF NOT EXISTS company_links (
     url TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 庭の「鉢の場所」と「花の種類」を、企業ごとに保存する
+--   garden_slot … 庭の何番目の場所か（0から数える。8か所で1つの庭）
+--   flower_kind … 咲く花の種類の名前（sunflower / tulip / daisy / bellflower / nemophila）
+ALTER TABLE companies ADD COLUMN garden_slot INTEGER;
+ALTER TABLE companies ADD COLUMN flower_kind TEXT;

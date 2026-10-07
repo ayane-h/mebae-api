@@ -99,6 +99,87 @@ function userDataDeleteStatements(env, userId) {
 	];
 }
 
+// ---- 庭の「鉢の場所」と「花の種類」 ----
+// どちらも、企業ごとにデータベースに保存しておく（companies の garden_slot / flower_kind）。
+//   garden_slot … 庭の何番目の場所か（0から数える。8か所で1つの庭なので、8以上は2つ目の庭）
+//   flower_kind … 咲く花の種類の名前
+// 保存しておくと、眠らせても ほかの鉢が動かず、花の種類を増やしても 咲いている花が入れ替わらない。
+
+// 花の種類の名前。フロントエンド（Garden.jsx の FLOWERS の kind）と同じ名前にしておく。
+// 花を増やす時は、Garden.jsx に画像を足して、ここにも名前を足す
+const FLOWER_KINDS = ["sunflower", "tulip", "daisy", "bellflower", "nemophila"];
+
+// 使われていない場所のうち、いちばん小さい番号を返す（used：使われている番号の集まり）
+function lowestFreeSlot(used) {
+	let slot = 0;
+	while (used.has(slot)) slot++;
+	return slot;
+}
+
+// まだ花の種類が決まっていない企業のための、番号(id)から決める花
+// （保存する仕組みを入れる前と、同じ花になる式。今まで咲いていた花が、入れ替わらないようにするため）
+function defaultFlowerKind(id) {
+	const n = FLOWER_KINDS.length;
+	return FLOWER_KINDS[(id + Math.floor(id / n)) % n];
+}
+
+// 新しく植える企業の花を選ぶ：その人の庭で、いちばん数が少ない種類にする（同じ花ばかりにならないように）
+// existingKinds：その人の企業にすでに付いている、花の種類の配列
+function pickFlowerKind(existingKinds) {
+	const n = FLOWER_KINDS.length;
+	const counts = FLOWER_KINDS.map((kind) => existingKinds.filter((k) => k === kind).length);
+	const min = Math.min(...counts);
+	// 同じ数の種類がいくつかある時に、いつも先頭の花にならないよう、企業の数だけ、探し始める位置をずらす
+	const start = existingKinds.length % n;
+	for (let i = 0; i < n; i++) {
+		const index = (start + i) % n;
+		if (counts[index] === min) return FLOWER_KINDS[index];
+	}
+	return FLOWER_KINDS[0];
+}
+
+// 鉢の場所・花の種類がまだ決まっていない企業に、値を決めて保存する
+// （この仕組みを入れる前からある企業や、デモの見本データのため。すでに決まっている企業は、何もしない）
+// companies：1人ぶんの企業の配列（id / is_sleeping / garden_slot / flower_kind を持つもの）。中身を書き換える
+async function ensureGardenData(env, companies) {
+	const byId = [...companies].sort((a, b) => a.id - b.id); // 植えた順
+	const used = new Set();     // 起きている企業が使っている場所
+	const needsSlot = new Set(); // 場所を決め直す必要がある企業のid
+
+	// 1. 起きている企業のうち、場所がきちんと決まっているものを先に数える
+	//    （場所が無い・ほかの企業と重なっている時は、決め直す）
+	for (const c of byId) {
+		if (c.is_sleeping) continue; // 眠っている企業は、場所を取らない
+		const valid = Number.isInteger(c.garden_slot) && c.garden_slot >= 0 && !used.has(c.garden_slot);
+		if (valid) used.add(c.garden_slot);
+		else needsSlot.add(c.id);
+	}
+
+	// 2. 決まっていないものに、値を決める（植えた順に、空いている場所の小さい番号から）
+	const statements = [];
+	for (const c of byId) {
+		let changed = false;
+		if (needsSlot.has(c.id)) {
+			c.garden_slot = lowestFreeSlot(used);
+			used.add(c.garden_slot);
+			changed = true;
+		}
+		if (!FLOWER_KINDS.includes(c.flower_kind)) {
+			c.flower_kind = defaultFlowerKind(c.id);
+			changed = true;
+		}
+		if (changed) {
+			statements.push(
+				env.DB.prepare("UPDATE companies SET garden_slot = ?, flower_kind = ? WHERE id = ?")
+					.bind(c.garden_slot ?? null, c.flower_kind, c.id)
+			);
+		}
+	}
+
+	// 3. まとめて保存する（変えたものが無ければ、何もしない）
+	if (statements.length > 0) await env.DB.batch(statements);
+}
+
 // ---- 古いデモの片づけ ----
 // 作ってから DEMO_KEEP_DAYS 日たったデモを、古い順に消す（Clerkのユーザー数の上限対策）
 // 1人ずつ「Clerkのユーザー → D1のデータ」の順に消す。
@@ -296,6 +377,14 @@ export default {
 				"SELECT * FROM companies WHERE user_id = ? ORDER BY created_at DESC"
 			).bind(userId).all();
 
+			// 鉢の場所・花の種類がまだ決まっていない企業があれば、ここで決めて保存する
+			// （保存に失敗しても、一覧は返す。画面側は、場所が無い時は植えた順に並べる）
+			try {
+				await ensureGardenData(env, companies);
+			} catch (err) {
+				console.error("鉢の場所・花の種類の保存に失敗しました:", err.message);
+			}
+
 			// 自分の企業のrecordsだけを、一度にまとめて取得する
 			const { results: allRecords } = await env.DB.prepare(
 				`SELECT r.company_id, r.category, r.created_at
@@ -359,10 +448,20 @@ export default {
 				);
 			}
 
+			// 鉢の場所と花の種類を決める
+			// （先に、今ある企業の場所をそろえておく。そのうえで、起きている企業が使っていない、いちばん小さい番号の場所に置く）
+			const { results: mine } = await env.DB.prepare(
+				"SELECT id, is_sleeping, garden_slot, flower_kind FROM companies WHERE user_id = ?"
+			).bind(userId).all();
+			await ensureGardenData(env, mine);
+			const usedSlots = new Set(mine.filter((c) => !c.is_sleeping).map((c) => c.garden_slot));
+			const gardenSlot = lowestFreeSlot(usedSlots);
+			const flowerKind = pickFlowerKind(mine.map((c) => c.flower_kind));
+
 			const result = await env.DB.prepare(
-				`INSERT INTO companies (user_id, company_name, job_url, job_text, interest_level)
-				VALUES (?, ?, ?, ?, ?)`
-			).bind(userId, company_name, job_url || null, job_text || null, interest_level || 3).run();
+				`INSERT INTO companies (user_id, company_name, job_url, job_text, interest_level, garden_slot, flower_kind)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`
+			).bind(userId, company_name, job_url || null, job_text || null, interest_level || 3, gardenSlot, flowerKind).run();
 
 			const newCompanyId = result.meta.last_row_id; // 今作った企業のid
 
@@ -405,6 +504,26 @@ export default {
 			if (body.is_sleeping !== undefined) {
 				fields.push("is_sleeping = ?");
 				values.push(body.is_sleeping ? 1 : 0);
+
+				// 眠りから起こす時：元の場所が空いていれば、そこに戻す。
+				// 眠っている間に別の企業が入っていたら、空いている場所の小さい番号に置く
+				// （眠らせる時は、場所の番号をそのまま残しておく。起こした時に、元の場所へ戻れるように）
+				if (!body.is_sleeping) {
+					const { results: mine } = await env.DB.prepare(
+						"SELECT id, is_sleeping, garden_slot, flower_kind FROM companies WHERE user_id = ?"
+					).bind(userId).all();
+					await ensureGardenData(env, mine);
+					const target = mine.find((c) => String(c.id) === String(id));
+					const usedByOthers = new Set(
+						mine.filter((c) => !c.is_sleeping && String(c.id) !== String(id)).map((c) => c.garden_slot)
+					);
+					const keepsOwnSlot =
+						target && Number.isInteger(target.garden_slot) && !usedByOthers.has(target.garden_slot);
+					if (!keepsOwnSlot) {
+						fields.push("garden_slot = ?");
+						values.push(lowestFreeSlot(usedByOthers));
+					}
+				}
 			}
 			if (body.short_memo !== undefined) {
 				// 前後の空白を取り除き、空ならnull（メモなし）として保存する
