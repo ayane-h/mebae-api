@@ -180,10 +180,31 @@ async function ensureGardenData(env, companies) {
 	if (statements.length > 0) await env.DB.batch(statements);
 }
 
+// ---- デモを1人ぶん消す ----
+// 「Clerkのユーザー → D1のデータ」の順に消す。
+// Clerk側で失敗した時は、エラーを投げて、D1のデータを残しておく（あとで、もう一度やり直せるように）
+// （「デモを終了」した時と、古いデモの片づけの両方で使う）
+// clerk：createClerkClient で作ったもの
+async function deleteDemoUser(env, clerk, demoUserId) {
+	// 1. Clerkのユーザーを消す
+	try {
+		await clerk.users.deleteUser(demoUserId);
+	} catch (err) {
+		// 404（すでにClerk側にいない）は、消し終わっているのと同じなので、そのまま先へ進む
+		if (err.status !== 404) throw err;
+	}
+
+	// 2. D1のデータと、demo_users の行をまとめて消す
+	//    （batchなので、途中で失敗した場合は、全体がなかったことになる）
+	await env.DB.batch([
+		...userDataDeleteStatements(env, demoUserId),
+		env.DB.prepare("DELETE FROM demo_users WHERE user_id = ?").bind(demoUserId),
+	]);
+}
+
 // ---- 古いデモの片づけ ----
 // 作ってから DEMO_KEEP_DAYS 日たったデモを、古い順に消す（Clerkのユーザー数の上限対策）
-// 1人ずつ「Clerkのユーザー → D1のデータ」の順に消す。
-// Clerk側で失敗した時は、D1のデータを残しておく（次の回に、もう一度やり直せるように）
+// 「デモを終了」を押さずに離れた人のぶんを、ここで片づける
 async function cleanupOldDemoUsers(env) {
 	const { results: oldDemos } = await env.DB.prepare(
 		`SELECT user_id FROM demo_users
@@ -200,20 +221,7 @@ async function cleanupOldDemoUsers(env) {
 
 	for (const demo of oldDemos) {
 		try {
-			// 1. Clerkのユーザーを消す
-			try {
-				await clerk.users.deleteUser(demo.user_id);
-			} catch (err) {
-				// 404（すでにClerk側にいない）は、消し終わっているのと同じなので、そのまま先へ進む
-				if (err.status !== 404) throw err;
-			}
-
-			// 2. D1のデータと、demo_users の行をまとめて消す
-			//    （batchなので、途中で失敗した場合は、全体がなかったことになる）
-			await env.DB.batch([
-				...userDataDeleteStatements(env, demo.user_id),
-				env.DB.prepare("DELETE FROM demo_users WHERE user_id = ?").bind(demo.user_id),
-			]);
+			await deleteDemoUser(env, clerk, demo.user_id);
 			deleted++;
 		} catch (err) {
 			failed++;
@@ -320,6 +328,28 @@ export default {
 				rematch_limit: DEMO_REMATCH_LIMIT,
 				rematch_remaining: demo ? Math.max(0, DEMO_REMATCH_LIMIT - demo.rematch_count) : null,
 			}, { headers: corsHeaders });
+		}
+
+		// DELETE /demo : 自分のデモを、今すぐ消す（「デモを終了する」を押した時に呼ぶ）
+		// 一度終了したデモには戻れないので、3日待たずにその場で消して、デモの枠を空ける
+		if (request.method === "DELETE" && url.pathname === "/demo") {
+			// デモの人だけが使える（ふつうに登録した人のアカウントを、まちがって消さないため）
+			const demo = await getDemoUser();
+			if (!demo) return notFound();
+
+			try {
+				const clerk = createClerkClient({ secretKey: env.CLERK_SECRET_KEY });
+				// 消す相手は、トークンから取り出した本人のid（画面から送られた値は使わない）
+				await deleteDemoUser(env, clerk, userId);
+				return Response.json({ success: true }, { headers: corsHeaders });
+			} catch (err) {
+				// 失敗しても、データは残っているので、古いデモの片づけ（定期実行）があとで消してくれる
+				console.error("デモの削除に失敗しました:", userId, err.message);
+				return Response.json(
+					{ error: "デモの削除に失敗しました" },
+					{ status: 500, headers: corsHeaders }
+				);
+			}
 		}
 
 		// この企業は、ログイン中のユーザー本人のものか？を確認する
